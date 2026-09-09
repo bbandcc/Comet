@@ -2,7 +2,7 @@
 
 - heartbeat：每分钟扫 agent_tasks 找到期的，一个事务内推进 next_run_at（防重复触发）后派发执行。
 - run_agent_task：跑深度研究引擎产出报告（research_reports，task_id 关联），回写任务状态。
-  - 单任务并发护栏：Redis 锁（SET NX + TTL，自愈，防 interval<耗时 或「立即运行」撞定时重叠跑）。
+  - 单任务并发护栏：Redis owner-aware 锁（SET NX + TTL + 原子释放，防重叠跑与误删锁）。
   - 整体硬超时：asyncio.wait_for（跨平台，Windows 上 celery time_limit 不生效）。
 
 队列：heartbeat → beat（轻量，不可被堵）；run → research（重活，独立队列）。
@@ -13,6 +13,7 @@ import uuid
 from datetime import datetime
 
 from redis import asyncio as aioredis
+from redis.exceptions import LockNotOwnedError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import app.models  # noqa: F401  确保 ORM 模型注册
@@ -77,29 +78,71 @@ def heartbeat_task() -> int:
 
 async def _run_task(task_id: str) -> None:
     tid = uuid.UUID(task_id)
+    attempt_id = uuid.uuid4().hex
     lock_key = f"agent_task:lock:{task_id}"
     lock_ttl = settings.research_task_timeout + 120  # 略大于超时，自动过期防死锁
     redis = aioredis.from_url(settings.redis_url, decode_responses=True)
+    lock = redis.lock(lock_key, timeout=lock_ttl, blocking=False)
+    acquired = False
     try:
         try:
-            got = await redis.set(lock_key, "1", nx=True, ex=lock_ttl)
+            acquired = await lock.acquire()
         except Exception as e:
-            # Redis 异常时不因锁失败而漏跑用户任务（可用性优先于严格互斥）
-            logger.warning("获取定时任务锁失败，继续执行: id=%s err=%s", tid, e)
-            got = True
-        if not got:
-            logger.info("定时任务已在运行中，跳过本次触发: id=%s", tid)
+            logger.error(
+                "获取定时任务锁失败，停止执行: id=%s attempt=%s "
+                "status=acquire_failed err_type=%s err=%s",
+                tid,
+                attempt_id,
+                type(e).__name__,
+                e,
+                exc_info=True,
+            )
+            raise
+        if not acquired:
+            logger.info(
+                "定时任务已在运行中，跳过本次触发: id=%s attempt=%s status=skipped_busy",
+                tid,
+                attempt_id,
+            )
             return
+        logger.info("定时任务锁获取成功: id=%s attempt=%s status=acquired", tid, attempt_id)
         await _do_run(tid)
     finally:
-        try:
-            await redis.delete(lock_key)
-        except Exception:  # noqa: BLE001
-            pass
+        if acquired:
+            try:
+                # redis-py 会用本次 acquire 的 token 执行 Lua compare-delete。
+                await lock.release()
+                logger.info(
+                    "定时任务锁释放成功: id=%s attempt=%s status=released",
+                    tid,
+                    attempt_id,
+                )
+            except LockNotOwnedError:
+                logger.warning(
+                    "定时任务锁所有权已丢失，跳过释放: id=%s attempt=%s status=lock_lost",
+                    tid,
+                    attempt_id,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "释放定时任务锁失败，等待 TTL 回收: id=%s attempt=%s "
+                    "status=release_failed err_type=%s err=%s",
+                    tid,
+                    attempt_id,
+                    type(e).__name__,
+                    e,
+                    exc_info=True,
+                )
         try:
             await redis.aclose()
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "关闭定时任务 Redis 客户端失败: id=%s attempt=%s err_type=%s err=%s",
+                tid,
+                attempt_id,
+                type(e).__name__,
+                e,
+            )
 
 
 async def _do_run(tid: uuid.UUID) -> None:
