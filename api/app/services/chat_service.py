@@ -5,6 +5,7 @@
 → 落库 user/assistant 消息（assistant 带引用与工具调用元信息）
 → 回答后异步派发记忆萃取（对话自动萃取）。
 """
+
 import asyncio
 import json
 import re
@@ -170,9 +171,7 @@ class ChatService:
                 out.append(AIMessage(content=m.content))
         return out
 
-    async def _cross_session_context(
-        self, user_id: uuid.UUID, current_conv_id: uuid.UUID
-    ) -> str:
+    async def _cross_session_context(self, user_id: uuid.UUID, current_conv_id: uuid.UUID) -> str:
         """跨会话上下文：取最近其他会话的标题 + 最后几轮，拼成参考背景块。
 
         纯 PG 查询（快），失败/无其他会话返回空串。
@@ -182,16 +181,12 @@ class ChatService:
             from app.models.conversation_model import ROLE_ASSISTANT, ROLE_USER
 
             convs = await self.conv_repo.list_by_user(user_id)
-            others = [c for c in convs if c.id != current_conv_id][
-                : _s.cross_session_max_convs
-            ]
+            others = [c for c in convs if c.id != current_conv_id][: _s.cross_session_max_convs]
             if not others:
                 return ""
             blocks: list[str] = []
             for c in others:
-                msgs = await self.msg_repo.recent_history(
-                    c.id, _s.cross_session_turns_per_conv
-                )
+                msgs = await self.msg_repo.recent_history(c.id, _s.cross_session_turns_per_conv)
                 if not msgs:
                     continue
                 lines = [f"〔会话「{c.title}」〕"]
@@ -224,14 +219,10 @@ class ChatService:
             from app.core.llm.resolver import get_optional_client_for_type
             from app.core.memory.retrieval.active_recall import recall_context
 
-            embed_client = await get_optional_client_for_type(
-                sess, user_id, "embedding"
-            )
+            embed_client = await get_optional_client_for_type(sess, user_id, "embedding")
             if embed_client is None:
                 return ""
-            return await recall_context(
-                embed_client=embed_client, user_id=user_id, query=query
-            )
+            return await recall_context(embed_client=embed_client, user_id=user_id, query=query)
         except Exception as e:
             logger.warning("主动记忆召回失败（忽略）: user=%s err=%s", user_id, e)
             return ""
@@ -322,9 +313,7 @@ class ChatService:
         if skill and skill.kb_id:
             kb_ids: list[str] | None = [str(skill.kb_id)]
         else:
-            kb_ids = await KnowledgeBaseRepository(self.session).list_chat_enabled_ids(
-                user_id
-            )
+            kb_ids = await KnowledgeBaseRepository(self.session).list_chat_enabled_ids(user_id)
         return overrides, kb_ids
 
     async def _build_tools(
@@ -407,9 +396,7 @@ class ChatService:
             # 拿回合锁：若已有同会话生成在跑（用户重复发/并发），不重复触发，只转发现有生成
             if await bus.acquire_turn_lock(cid):
                 task = asyncio.create_task(
-                    self._run_chat_turn_bg(
-                        user_id, conv_uuid, body, attachments, skip_user_message
-                    )
+                    self._run_chat_turn_bg(user_id, conv_uuid, body, attachments, skip_user_message)
                 )
                 _BG_TASKS.add(task)
                 task.add_done_callback(_BG_TASKS.discard)
@@ -477,10 +464,7 @@ class ChatService:
                     continue
                 yield _sse("token", {"text": data.get("text", "")})
             elif ev == "tool_start":
-                yield _sse(
-                    "tool_start",
-                    {"tool": data.get("tool"), "query": data.get("query", "")},
-                )
+                yield _sse("tool_start", data)
             elif ev == "tool_result":
                 yield _sse("tool_result", data)
             elif ev == "citation":
@@ -559,38 +543,41 @@ class ChatService:
                             if n % _BUFFER_FLUSH_EVERY == 0:
                                 await _flush_buffer("generating")
                         elif etype in {"tool_call", "tool_start"}:
-                            tool_calls.append({
-                                "tool": ev["tool"],
-                                "query": ev.get("query", ""),
-                                "status": "running",
-                            })
+                            event_data = {key: value for key, value in ev.items() if key != "type"}
+                            tool_calls.append({**event_data, "status": "running"})
                             await bus.publish(
                                 cid,
                                 "tool_start",
-                                {"tool": ev["tool"], "query": ev.get("query", "")},
+                                event_data,
                             )
                         elif etype == "tool_result":
+                            call_id = ev.get("call_id")
                             for item in reversed(tool_calls):
-                                if (
-                                    item.get("tool") == ev["tool"]
-                                    and item.get("status") == "running"
-                                ):
-                                    item["status"] = ev.get("status", "success")
-                                    item["stats"] = ev.get("stats") or {}
-                                    item["latency_ms"] = ev.get("latency_ms")
-                                    item["preview"] = ev.get("text", "")
+                                same_call = (
+                                    item.get("call_id") == call_id
+                                    if call_id
+                                    else item.get("tool") == ev["tool"]
+                                )
+                                if same_call and item.get("status") == "running":
+                                    item.update(
+                                        {
+                                            "status": ev.get("status", "success"),
+                                            "stats": ev.get("stats") or {},
+                                            "latency_ms": ev.get("latency_ms"),
+                                            "preview": ev.get("text", ""),
+                                            "cached": ev.get("cached", False),
+                                            "error_code": ev.get("error_code"),
+                                            "retryable": ev.get("retryable", False),
+                                            "attempt": ev.get("attempt", 1),
+                                            "artifact_ref": ev.get("artifact_ref"),
+                                        }
+                                    )
                                     break
+                            event_data = {key: value for key, value in ev.items() if key != "type"}
                             await bus.publish(
                                 cid,
                                 "tool_result",
-                                {
-                                    "tool": ev["tool"],
-                                    "query": ev.get("query", ""),
-                                    "status": ev.get("status", "success"),
-                                    "text": ev.get("text", ""),
-                                    "stats": ev.get("stats") or {},
-                                    "latency_ms": ev.get("latency_ms"),
-                                },
+                                event_data,
                             )
                         elif etype == "final" and not full_text:
                             full_text = ev["text"]
@@ -680,9 +667,7 @@ class ChatService:
             放最后才不会被前面的背景信息块（已知记忆/跨会话/时效引导）冲淡回助手腔。
             """
             human = agent is not None and agent.human_mode
-            sp = (
-                base_prompt + "\n\n" + current_context_block(with_tool_hint=has_tools)
-            ).strip()
+            sp = (base_prompt + "\n\n" + current_context_block(with_tool_hint=has_tools)).strip()
             if agent is None or agent.enable_active_recall:
                 recall = await self._recall_lagged(user_id, user_text)
                 if recall:
@@ -727,9 +712,7 @@ class ChatService:
             lc_messages.extend(history)
             lc_messages.append(HumanMessage(content=composed_text))
             tracer = get_tracer()
-            async with tracer.llm_span(
-                f"对话:{config.model_name}", model_name=config.model_name
-            ):
+            async with tracer.llm_span(f"对话:{config.model_name}", model_name=config.model_name):
                 agg = None
                 async for chunk in model.astream(lc_messages):
                     agg = chunk if agg is None else agg + chunk
@@ -750,7 +733,11 @@ class ChatService:
         else:
             # 弱模型：ReAct
             async for ev in run_react(
-                model, tools, composed_text, history, system_prompt,
+                model,
+                tools,
+                composed_text,
+                history,
+                system_prompt,
                 stats_holder=stats_holder,
             ):
                 yield ev
@@ -807,9 +794,7 @@ class ChatService:
 
         from langchain_core.messages import HumanMessage, SystemMessage
 
-        config = await get_default_config_for_type(
-            self.session, user_id, "multimodal", "多模态"
-        )
+        config = await get_default_config_for_type(self.session, user_id, "multimodal", "多模态")
         model = build_chat_model(config, temperature=0.7, streaming=True)
 
         storage = get_storage()
@@ -823,10 +808,12 @@ class ChatService:
 
                 data, mime = compress_for_vision(raw, Path(key).suffix)
                 b64 = base64.b64encode(data).decode()
-                content_parts.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:{mime};base64,{b64}"},
-                })
+                content_parts.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime};base64,{b64}"},
+                    }
+                )
             except Exception as e:
                 logger.warning("读取/压缩对话图片失败（跳过）: %s", e)
 
@@ -838,9 +825,7 @@ class ChatService:
 
         # 包一层 llm_call span：多模态看图这轮也能在「执行轨迹」看到模型/耗时/token
         tracer = get_tracer()
-        async with tracer.llm_span(
-            f"多模态:{config.model_name}", model_name=config.model_name
-        ):
+        async with tracer.llm_span(f"多模态:{config.model_name}", model_name=config.model_name):
             agg = None
             async for chunk in model.astream(messages):
                 agg = chunk if agg is None else agg + chunk
@@ -855,9 +840,7 @@ class ChatService:
             from app.models.memory_model import MEMORY_SOURCE_AUTO, Memory
             from app.tasks.memory import extract_memory_task
 
-            memory = Memory(
-                user_id=user_id, raw_text=user_text, source=MEMORY_SOURCE_AUTO
-            )
+            memory = Memory(user_id=user_id, raw_text=user_text, source=MEMORY_SOURCE_AUTO)
             self.session.add(memory)
             await self.session.commit()
             await self.session.refresh(memory)
@@ -865,9 +848,7 @@ class ChatService:
         except Exception as e:
             logger.warning("对话记忆萃取派发失败（忽略）: %s", e)
 
-    async def _ingest_chat_images(
-        self, user_id: uuid.UUID, image_keys: list[str]
-    ) -> None:
+    async def _ingest_chat_images(self, user_id: uuid.UUID, image_keys: list[str]) -> None:
         """把对话里上传的图片纳入图片库（建 Image 记录 + 派发处理）。
 
         按 file_key 去重，失败不影响对话。
@@ -898,9 +879,7 @@ class ChatService:
         try:
             from app.tasks.emotion import analyze_emotion_task
 
-            analyze_emotion_task.delay(
-                str(user_id), text, str(conversation_id), str(message_id)
-            )
+            analyze_emotion_task.delay(str(user_id), text, str(conversation_id), str(message_id))
         except Exception as e:
             logger.warning("情绪分析派发失败（忽略）: user=%s err=%s", user_id, e)
 
@@ -930,9 +909,7 @@ class ChatService:
         )
         return {"id": str(fb.id), "rating": fb.rating}
 
-    async def remove_feedback(
-        self, user_id: uuid.UUID, message_id: uuid.UUID
-    ) -> None:
+    async def remove_feedback(self, user_id: uuid.UUID, message_id: uuid.UUID) -> None:
         """取消对某条 AI 回复的反馈。"""
         from app.repositories.message_feedback_repository import (
             MessageFeedbackRepository,
@@ -983,9 +960,7 @@ class ChatService:
             yield _sse("error", {"message": f"重新生成失败：{e}"})
             return
 
-        body = ChatStreamRequest(
-            conversation_id=conv.id, message=user_msg.content
-        )
+        body = ChatStreamRequest(conversation_id=conv.id, message=user_msg.content)
         # 复用流式问答；但用户消息已存在，这里跳过再次落 user 消息
         async for chunk in self.stream_chat(user_id, body, skip_user_message=True):
             yield chunk

@@ -1,7 +1,10 @@
 """联网搜索工具：从互联网获取实时信息。需用户配置 websearch 模型。"""
+
+import httpx
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field
 
+from app.core.agent.tool_contract import ToolExecutionError
 from app.core.agent.tools.base import ToolBuildContext, ToolSpec, register_tool
 from app.core.logging import get_logger
 
@@ -39,10 +42,29 @@ async def _build(ctx: ToolBuildContext) -> StructuredTool | None:
 
         try:
             result = await web_search(provider, api_key, query, top_k=10)
-        except Exception as e:
-            logger.warning("联网搜索失败: %s", e)
+        except httpx.TimeoutException as exc:
+            logger.warning("联网搜索超时: %s", exc)
             stats_holder[KEY] = {"web_count": 0, "provider": provider}
-            return f"联网搜索失败：{e}"
+            raise ToolExecutionError(
+                f"联网搜索超时：{exc}",
+                error_code="web_search_timeout",
+                retryable=True,
+            ) from exc
+        except httpx.TransportError as exc:
+            logger.warning("联网搜索传输失败: %s", exc)
+            stats_holder[KEY] = {"web_count": 0, "provider": provider}
+            raise ToolExecutionError(
+                f"联网搜索失败：{exc}",
+                error_code="web_search_transport",
+                retryable=True,
+            ) from exc
+        except Exception as exc:
+            logger.warning("联网搜索失败: %s", exc)
+            stats_holder[KEY] = {"web_count": 0, "provider": provider}
+            raise ToolExecutionError(
+                f"联网搜索失败：{exc}",
+                error_code="web_search_failed",
+            ) from exc
         # 统计：按结果块数 [1] [2] ... 推断网页数；空返回则记 0
         import re
 
@@ -68,5 +90,7 @@ register_tool(
         needs_config=True,
         config_hint="需先在「模型配置」添加 websearch 类型模型（百度千帆 / tavily）",
         default_enabled=False,
+        read_only=True,
+        cacheable=True,
     )
 )

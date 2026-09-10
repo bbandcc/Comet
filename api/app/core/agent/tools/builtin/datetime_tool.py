@@ -1,4 +1,5 @@
 """时间工具：返回当前日期时间（北京时间 UTC+8，零外部依赖）。"""
+
 from datetime import datetime, timedelta, timezone
 
 from langchain_core.tools import StructuredTool
@@ -39,5 +40,7 @@ register_tool(
         icon="🕐",
         builder=_build,
         default_enabled=True,
+        read_only=True,
+        cacheable=False,
     )
 )

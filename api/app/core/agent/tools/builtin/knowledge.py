@@ -1,4 +1,5 @@
 """知识库检索工具：检索文档/图片片段并收集引用。"""
+
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field
 
@@ -37,12 +38,14 @@ async def _build(ctx: ToolBuildContext) -> StructuredTool:
             sid = h.get("source_id")
             if sid and sid not in seen:
                 seen.add(sid)
-                citations.append({
-                    "source_id": sid,
-                    "source_type": h.get("source_type"),
-                    "doc_name": h.get("doc_name"),
-                    "score": h.get("score"),
-                })
+                citations.append(
+                    {
+                        "source_id": sid,
+                        "source_type": h.get("source_type"),
+                        "doc_name": h.get("doc_name"),
+                        "score": h.get("score"),
+                    }
+                )
         return "检索到以下知识库内容：\n\n" + "\n\n".join(parts)
 
     return StructuredTool.from_function(
@@ -61,5 +64,7 @@ register_tool(
         icon="🔍",
         builder=_build,
         default_enabled=True,
+        read_only=True,
+        cacheable=True,
     )
 )

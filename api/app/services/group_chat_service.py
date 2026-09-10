@@ -13,6 +13,7 @@ SSE 事件：
 - done：{conversation_id}
 - error：{message}
 """
+
 import json
 import uuid
 from collections.abc import AsyncGenerator
@@ -77,6 +78,33 @@ def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+def _tool_event_data(event: dict) -> dict:
+    return {key: value for key, value in event.items() if key != "type"}
+
+
+def _finish_tool_call(tool_calls: list[dict], event: dict) -> None:
+    call_id = event.get("call_id")
+    for item in reversed(tool_calls):
+        same_call = (
+            item.get("call_id") == call_id if call_id else item.get("tool") == event.get("tool")
+        )
+        if same_call and item.get("status") == "running":
+            item.update(
+                {
+                    "status": event.get("status", "success"),
+                    "stats": event.get("stats") or {},
+                    "latency_ms": event.get("latency_ms"),
+                    "preview": event.get("text", ""),
+                    "cached": event.get("cached", False),
+                    "error_code": event.get("error_code"),
+                    "retryable": event.get("retryable", False),
+                    "attempt": event.get("attempt", 1),
+                    "artifact_ref": event.get("artifact_ref"),
+                }
+            )
+            return
+
+
 class GroupChatService:
     def __init__(self, session: AsyncSession):
         self.session = session
@@ -87,15 +115,11 @@ class GroupChatService:
 
     # ── 群会话管理 ──
 
-    async def create_group(
-        self, user_id: uuid.UUID, body: GroupCreateRequest
-    ) -> Conversation:
+    async def create_group(self, user_id: uuid.UUID, body: GroupCreateRequest) -> Conversation:
         """新建群聊会话：校验成员数量与归属。"""
         ids = list(dict.fromkeys(body.member_persona_ids))  # 去重保序
         if not (MIN_MEMBERS <= len(ids) <= MAX_MEMBERS):
-            raise BizError(
-                f"群成员需 {MIN_MEMBERS}~{MAX_MEMBERS} 个角色", code=4060
-            )
+            raise BizError(f"群成员需 {MIN_MEMBERS}~{MAX_MEMBERS} 个角色", code=4060)
         # 校验每个角色卡都归属当前用户
         members = []
         for pid in ids:
@@ -113,9 +137,7 @@ class GroupChatService:
             enable_tools=bool(body.enable_tools),
         )
         created = await self.conv_repo.create(conv)
-        logger.info(
-            "创建群聊: user=%s conv=%s members=%d", user_id, created.id, len(ids)
-        )
+        logger.info("创建群聊: user=%s conv=%s members=%d", user_id, created.id, len(ids))
         return created
 
     async def _dedup_title(self, user_id: uuid.UUID, title: str) -> str:
@@ -132,9 +154,7 @@ class GroupChatService:
 
         base = re.sub(r"（\d+）$", "", title).strip() or "群聊"
         result = await self.session.execute(
-            select(_Conv.title).where(
-                _Conv.user_id == user_id, _Conv.is_group.is_(True)
-            )
+            select(_Conv.title).where(_Conv.user_id == user_id, _Conv.is_group.is_(True))
         )
         existing = {(t or "") for (t,) in result.all()}
         if base not in existing and title not in existing:
@@ -145,18 +165,14 @@ class GroupChatService:
             n += 1
         return f"{base}（{n}）"
 
-    async def get_group_or_404(
-        self, user_id: uuid.UUID, conv_id: uuid.UUID
-    ) -> Conversation:
+    async def get_group_or_404(self, user_id: uuid.UUID, conv_id: uuid.UUID) -> Conversation:
         """取群聊会话，不存在或非群聊则报错。"""
         conv = await self.conv_repo.get(user_id, conv_id)
         if conv is None or not conv.is_group:
             raise BizError("群聊会话不存在", code=4062, status_code=404)
         return conv
 
-    async def list_members(
-        self, user_id: uuid.UUID, conv_id: uuid.UUID
-    ) -> list[dict]:
+    async def list_members(self, user_id: uuid.UUID, conv_id: uuid.UUID) -> list[dict]:
         """对外：获取群成员角色卡（群主或已加入成员均可；角色卡归属群主）。"""
         conv = await self.get_group_for_member(user_id, conv_id)
         return await self._load_members(conv.user_id, conv)
@@ -214,25 +230,23 @@ class GroupChatService:
             for m in humans_sorted:
                 u = await self.session.get(User, m.user_id)
                 has_avatar = bool(u and u.avatar)
-                name = (m.nickname or "").strip() or await self._default_nickname(
-                    m.user_id
+                name = (m.nickname or "").strip() or await self._default_nickname(m.user_id)
+                out.append(
+                    {
+                        "name": name,
+                        "avatar_url": (
+                            f"/api/groups/{conv.id}/members/{m.user_id}/avatar"
+                            if has_avatar
+                            else None
+                        ),
+                    }
                 )
-                out.append({
-                    "name": name,
-                    "avatar_url": (
-                        f"/api/groups/{conv.id}/members/{m.user_id}/avatar"
-                        if has_avatar
-                        else None
-                    ),
-                })
         except Exception as e:
             logger.warning("群头像真人成员加载失败（忽略）: %s", e)
         # AI 角色卡
         for pid in conv.member_persona_ids or []:
             try:
-                persona = await self.persona_repo.get(
-                    conv.user_id, uuid.UUID(str(pid))
-                )
+                persona = await self.persona_repo.get(conv.user_id, uuid.UUID(str(pid)))
             except (ValueError, TypeError):
                 persona = None
             if persona is None:
@@ -294,9 +308,7 @@ class GroupChatService:
         """不限归属地按 id 取会话（成员鉴权前的原始查询）。"""
         from sqlalchemy import select
 
-        result = await self.session.execute(
-            select(Conversation).where(Conversation.id == conv_id)
-        )
+        result = await self.session.execute(select(Conversation).where(Conversation.id == conv_id))
         return result.scalar_one_or_none()
 
     async def _ensure_owner_member(self, conv: Conversation) -> None:
@@ -313,9 +325,7 @@ class GroupChatService:
                 )
             )
 
-    async def get_group_for_member(
-        self, user_id: uuid.UUID, conv_id: uuid.UUID
-    ) -> Conversation:
+    async def get_group_for_member(self, user_id: uuid.UUID, conv_id: uuid.UUID) -> Conversation:
         """取群聊会话并校验当前用户是群成员（群主或已加入者）。"""
         conv = await self._get_conv_any(conv_id)
         if conv is None or not conv.is_group:
@@ -327,9 +337,7 @@ class GroupChatService:
             raise BizError("你不是该群成员", code=4063, status_code=403)
         return conv
 
-    async def get_or_create_join_code(
-        self, user_id: uuid.UUID, conv_id: uuid.UUID
-    ) -> str:
+    async def get_or_create_join_code(self, user_id: uuid.UUID, conv_id: uuid.UUID) -> str:
         """群主获取邀请码（无则生成）。"""
         conv = await self.get_group_or_404(user_id, conv_id)  # 仅群主
         await self._ensure_owner_member(conv)
@@ -338,9 +346,7 @@ class GroupChatService:
             await self.conv_repo.save(conv)
         return conv.join_code
 
-    async def set_tools(
-        self, user_id: uuid.UUID, conv_id: uuid.UUID, enabled: bool
-    ) -> bool:
+    async def set_tools(self, user_id: uuid.UUID, conv_id: uuid.UUID, enabled: bool) -> bool:
         """群主开/关本群的工具（知识库/记忆/联网/MCP）。返回最新状态。
 
         仅群主可改（AI 用群主算力、工具走群主配置）；get_group_or_404 已限定为本人会话。
@@ -348,9 +354,7 @@ class GroupChatService:
         conv = await self.get_group_or_404(user_id, conv_id)
         conv.enable_tools = bool(enabled)
         await self.conv_repo.save(conv)
-        logger.info(
-            "群聊工具开关: conv=%s enabled=%s by=%s", conv_id, enabled, user_id
-        )
+        logger.info("群聊工具开关: conv=%s enabled=%s by=%s", conv_id, enabled, user_id)
         return conv.enable_tools
 
     async def reset_join_code(self, user_id: uuid.UUID, conv_id: uuid.UUID) -> str:
@@ -390,9 +394,7 @@ class GroupChatService:
                 )
             )
             logger.info("加入群聊: user=%s conv=%s", user_id, conv.id)
-            await bus.publish(
-                str(conv.id), "presence", {"type": "join", "nickname": nick[:64]}
-            )
+            await bus.publish(str(conv.id), "presence", {"type": "join", "nickname": nick[:64]})
         return conv
 
     async def leave_group(self, user_id: uuid.UUID, conv_id: uuid.UUID) -> None:
@@ -405,9 +407,7 @@ class GroupChatService:
         await self.member_repo.remove(conv_id, user_id)
         await bus.publish(str(conv_id), "presence", {"type": "leave", "nickname": nick})
 
-    async def list_humans(
-        self, user_id: uuid.UUID, conv_id: uuid.UUID
-    ) -> list[dict]:
+    async def list_humans(self, user_id: uuid.UUID, conv_id: uuid.UUID) -> list[dict]:
         """群里的真人成员列表（含当前用户标记 + 头像地址）。"""
         await self.get_group_for_member(user_id, conv_id)
         conv = await self._get_conv_any(conv_id)
@@ -436,9 +436,7 @@ class GroupChatService:
                     "is_me": m.user_id == user_id,
                     "online": str(m.user_id) in online,
                     "avatar_url": (
-                        f"/api/groups/{conv_id}/members/{m.user_id}/avatar"
-                        if has_avatar
-                        else None
+                        f"/api/groups/{conv_id}/members/{m.user_id}/avatar" if has_avatar else None
                     ),
                 }
             )
@@ -504,9 +502,7 @@ class GroupChatService:
         )
         return list(result.scalars().all())
 
-    async def list_group_messages(
-        self, user_id: uuid.UUID, conv_id: uuid.UUID
-    ) -> list[dict]:
+    async def list_group_messages(self, user_id: uuid.UUID, conv_id: uuid.UUID) -> list[dict]:
         """群聊历史消息（成员可读，区分真人发送者与 AI 角色）。"""
         await self.get_group_for_member(user_id, conv_id)
         messages = await self.msg_repo.list_by_conversation(conv_id)
@@ -533,9 +529,7 @@ class GroupChatService:
                     "content": m.content,
                     "meta_data": meta,
                     "images": _image_urls(meta),
-                    "sender_persona_id": str(m.sender_persona_id)
-                    if m.sender_persona_id
-                    else None,
+                    "sender_persona_id": str(m.sender_persona_id) if m.sender_persona_id else None,
                     "sender_user_id": sender_user_id,
                     "sender_name": meta.get("sender_name"),
                     "is_me": sender_user_id == str(user_id),
@@ -546,9 +540,7 @@ class GroupChatService:
 
     # ── 多人实时群聊：发言（广播 + 后台 AI）+ 事件订阅 ──
 
-    async def say(
-        self, user_id: uuid.UUID, conv_id: uuid.UUID, body: GroupSayRequest
-    ) -> dict:
+    async def say(self, user_id: uuid.UUID, conv_id: uuid.UUID, body: GroupSayRequest) -> dict:
         """某真人成员发言：落库 → 广播给全员 → 后台触发 AI 接话，立即返回。"""
         conv = await self.get_group_for_member(user_id, conv_id)
         await self._ensure_owner_member(conv)
@@ -594,9 +586,7 @@ class GroupChatService:
         # 后台触发 AI 接话（独立 session，不阻塞本次 HTTP）
         import asyncio
 
-        task = asyncio.create_task(
-            self._run_ai_turn_bg(conv_id, conv.user_id, text, image_keys)
-        )
+        task = asyncio.create_task(self._run_ai_turn_bg(conv_id, conv.user_id, text, image_keys))
         _BG_TASKS.add(task)
         task.add_done_callback(_BG_TASKS.discard)
         return {"message_id": str(msg.id)}
@@ -665,9 +655,7 @@ class GroupChatService:
             host_model, _ = await build_default_chat_model(
                 self.session, owner_id, temperature=0.3, streaming=False
             )
-            speakers = await decide_speakers(
-                host_model, members, transcript, user_text
-            )
+            speakers = await decide_speakers(host_model, members, transcript, user_text)
 
         # 主持人判定本轮纯属真人之间聊天 → AI 不接话，直接收尾
         if not speakers:
@@ -691,9 +679,7 @@ class GroupChatService:
 
                 self._tool_citations = []
                 self._tool_stats = {}
-                kb_ids = await KnowledgeBaseRepository(
-                    self.session
-                ).list_chat_enabled_ids(owner_id)
+                kb_ids = await KnowledgeBaseRepository(self.session).list_chat_enabled_ids(owner_id)
                 tools = await self._mcp_stack.enter_async_context(
                     build_enabled_tools_cm(
                         self.session,
@@ -714,9 +700,7 @@ class GroupChatService:
                 mm_config = await get_default_config_for_type(
                     self.session, owner_id, "multimodal", "多模态"
                 )
-                speaker_model = build_chat_model(
-                    mm_config, temperature=0.8, streaming=True
-                )
+                speaker_model = build_chat_model(mm_config, temperature=0.8, streaming=True)
                 self._speaker_config = mm_config
                 image_parts = await self._load_image_parts(image_keys)
             except Exception as e:
@@ -756,25 +740,19 @@ class GroupChatService:
                             {"persona_id": member["id"], "text": ev["text"]},
                         )
                     elif ev["type"] == "tool_start":
-                        tool_calls.append(
-                            {"tool": ev["tool"], "query": ev.get("query", "")}
-                        )
+                        event_data = _tool_event_data(ev)
+                        tool_calls.append({**event_data, "status": "running"})
                         await bus.publish(
                             cid,
                             "tool_start",
-                            {"tool": ev["tool"], "query": ev.get("query", "")},
+                            event_data,
                         )
                     elif ev["type"] == "tool_result":
+                        _finish_tool_call(tool_calls, ev)
                         await bus.publish(
                             cid,
                             "tool_result",
-                            {
-                                "tool": ev["tool"],
-                                "query": ev.get("query", ""),
-                                "status": ev.get("status", "success"),
-                                "stats": ev.get("stats") or {},
-                                "latency_ms": ev.get("latency_ms"),
-                            },
+                            _tool_event_data(ev),
                         )
                     elif ev["type"] == "final" and not full_text:
                         full_text = ev["text"]
@@ -807,9 +785,7 @@ class GroupChatService:
         await self.conv_repo.touch(conv_id)
         await bus.publish(cid, "done", {"conversation_id": cid})
 
-    async def events(
-        self, user_id: uuid.UUID, conv_id: uuid.UUID
-    ) -> AsyncGenerator[str, None]:
+    async def events(self, user_id: uuid.UUID, conv_id: uuid.UUID) -> AsyncGenerator[str, None]:
         """SSE：订阅群聊频道，把全员发言与 AI 接话事件实时推给前端。
 
         附带在线状态维护：建立连接即标记在线、每次心跳刷新、断开时标记离线，
@@ -892,9 +868,7 @@ class GroupChatService:
                 host_model, _ = await build_default_chat_model(
                     self.session, user_id, temperature=0.3, streaming=False
                 )
-                speakers = await decide_speakers(
-                    host_model, members, transcript, user_text
-                )
+                speakers = await decide_speakers(host_model, members, transcript, user_text)
         except BizError as e:
             yield _sse("error", {"message": e.message})
             return
@@ -923,9 +897,7 @@ class GroupChatService:
 
                 self._tool_citations = []
                 self._tool_stats = {}
-                kb_ids = await KnowledgeBaseRepository(
-                    self.session
-                ).list_chat_enabled_ids(user_id)
+                kb_ids = await KnowledgeBaseRepository(self.session).list_chat_enabled_ids(user_id)
                 tools = await build_enabled_tools(
                     self.session,
                     user_id,
@@ -944,9 +916,7 @@ class GroupChatService:
                 mm_config = await get_default_config_for_type(
                     self.session, user_id, "multimodal", "多模态"
                 )
-                speaker_model = build_chat_model(
-                    mm_config, temperature=0.8, streaming=True
-                )
+                speaker_model = build_chat_model(mm_config, temperature=0.8, streaming=True)
                 self._speaker_config = mm_config
                 image_parts = await self._load_image_parts(image_keys)
             except BizError as e:
@@ -984,25 +954,12 @@ class GroupChatService:
                         full_text += ev["text"]
                         yield _sse("token", {"text": ev["text"]})
                     elif ev["type"] == "tool_start":
-                        tool_calls.append(
-                            {"tool": ev["tool"], "query": ev.get("query", "")}
-                        )
-                        yield _sse(
-                            "tool_start",
-                            {"tool": ev["tool"], "query": ev.get("query", "")},
-                        )
+                        event_data = _tool_event_data(ev)
+                        tool_calls.append({**event_data, "status": "running"})
+                        yield _sse("tool_start", event_data)
                     elif ev["type"] == "tool_result":
-                        yield _sse(
-                            "tool_result",
-                            {
-                                "tool": ev["tool"],
-                                "query": ev.get("query", ""),
-                                "status": ev.get("status", "success"),
-                                "text": ev.get("text", ""),
-                                "stats": ev.get("stats") or {},
-                                "latency_ms": ev.get("latency_ms"),
-                            },
-                        )
+                        _finish_tool_call(tool_calls, ev)
+                        yield _sse("tool_result", _tool_event_data(ev))
                     elif ev["type"] == "final" and not full_text:
                         full_text = ev["text"]
             except Exception as e:
@@ -1096,7 +1053,11 @@ class GroupChatService:
         # 纯人设、无图：直接流式
         if not tools and not image_parts:
             async for token in stream_speaker(
-                model, member["system_prompt"], member["name"], member_names, transcript,
+                model,
+                member["system_prompt"],
+                member["name"],
+                member_names,
+                transcript,
                 human_mode=human_mode,
             ):
                 yield {"type": "token", "text": token}
@@ -1120,14 +1081,16 @@ class GroupChatService:
                 async for chunk in model.astream(messages):
                     if chunk.content:
                         text = (
-                            chunk.content
-                            if isinstance(chunk.content, str)
-                            else str(chunk.content)
+                            chunk.content if isinstance(chunk.content, str) else str(chunk.content)
                         )
                         yield {"type": "token", "text": text}
                 return
             async for ev in run_react(
-                model, tools, turn_text, [], system_prompt,
+                model,
+                tools,
+                turn_text,
+                [],
+                system_prompt,
                 stats_holder=self._tool_stats,
             ):
                 yield ev
@@ -1152,11 +1115,7 @@ class GroupChatService:
         ]
         async for chunk in model.astream(messages):
             if chunk.content:
-                text = (
-                    chunk.content
-                    if isinstance(chunk.content, str)
-                    else str(chunk.content)
-                )
+                text = chunk.content if isinstance(chunk.content, str) else str(chunk.content)
                 yield {"type": "token", "text": text}
 
 

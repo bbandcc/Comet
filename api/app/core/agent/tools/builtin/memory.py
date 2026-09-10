@@ -1,4 +1,5 @@
 """记忆检索工具：从记忆图谱召回相关实体与关系。"""
+
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field
 
@@ -54,5 +55,7 @@ register_tool(
         icon="🧠",
         builder=_build,
         default_enabled=True,
+        read_only=False,
+        cacheable=False,
     )
 )

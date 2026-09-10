@@ -3,9 +3,11 @@
 依赖 agent_tasks 表与调度（批次②）。只在支持 function calling 的强模型路径下有意义，
 弱模型默认不开（default_enabled=False）。
 """
+
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field
 
+from app.core.agent.tool_contract import ToolExecutionError
 from app.core.agent.tools.base import ToolBuildContext, ToolSpec, register_tool
 from app.core.logging import get_logger
 
@@ -15,19 +17,15 @@ KEY = "create_scheduled_task"
 
 
 class _ScheduleInput(BaseModel):
-    instruction: str = Field(..., description="要定时研究的主题/指令，如'汇总AI Agent秋招岗位与投递链接'")
+    instruction: str = Field(
+        ..., description="要定时研究的主题/指令，如'汇总AI Agent秋招岗位与投递链接'"
+    )
     trigger_type: str = Field(
         "daily", description="触发方式：daily(每天) / weekly(每周) / interval(每隔N小时)"
     )
-    time: str | None = Field(
-        None, description="触发时间 HH:MM（daily/weekly 必填），如 '09:00'"
-    )
-    weekday: int | None = Field(
-        None, description="周几触发，0=周一..6=周日（weekly 必填）"
-    )
-    interval_hours: int | None = Field(
-        None, description="间隔小时数（interval 必填）"
-    )
+    time: str | None = Field(None, description="触发时间 HH:MM（daily/weekly 必填），如 '09:00'")
+    weekday: int | None = Field(None, description="周几触发，0=周一..6=周日（weekly 必填）")
+    interval_hours: int | None = Field(None, description="间隔小时数（interval 必填）")
     name: str | None = Field(None, description="任务名，可选，不填用指令前段")
 
 
@@ -61,11 +59,18 @@ async def _build(ctx: ToolBuildContext) -> StructuredTool:
         )
         try:
             task = await AgentTaskService(session).create(user_id, body)
-        except BizError as e:
-            return f"创建定时任务失败：{e.message}"
-        except Exception as e:
-            logger.warning("对话创建定时任务失败: %s", e)
-            return f"创建定时任务失败：{e}"
+        except BizError as exc:
+            raise ToolExecutionError(
+                f"创建定时任务失败：{exc.message}",
+                error_code="scheduled_task_rejected",
+            ) from exc
+        except Exception as exc:
+            logger.warning("对话创建定时任务失败: %s", exc)
+            # 写入是否已经提交并不总能从异常判断，因此绝不标记为可重试。
+            raise ToolExecutionError(
+                f"创建定时任务失败：{exc}",
+                error_code="scheduled_task_create_failed",
+            ) from exc
         when = task.next_run_at.strftime("%m-%d %H:%M") if task.next_run_at else "稍后"
         return (
             f"已创建定时任务「{task.name}」，将于 {when} 首次自动运行深度研究，"
@@ -91,5 +96,7 @@ register_tool(
         icon="⏰",
         builder=_build,
         default_enabled=True,
+        read_only=False,
+        cacheable=False,
     )
 )

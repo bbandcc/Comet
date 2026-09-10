@@ -2,6 +2,7 @@
 
 启停优先级：本轮 overrides（对话请求临时开关） > 用户 tool_configs 持久配置 > ToolSpec.default_enabled。
 """
+
 import uuid
 from contextlib import asynccontextmanager
 
@@ -9,7 +10,12 @@ from langchain_core.tools import BaseTool
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import app.core.agent.tools.builtin  # noqa: F401  触发内置工具注册
-from app.core.agent.tools.base import BUILTIN_REGISTRY, ToolBuildContext
+from app.core.agent.tools.base import (
+    BUILTIN_REGISTRY,
+    TOOL_CACHEABLE_METADATA_KEY,
+    TOOL_READ_ONLY_METADATA_KEY,
+    ToolBuildContext,
+)
 from app.core.logging import get_logger
 from app.repositories.tool_config_repository import ToolConfigRepository
 
@@ -55,6 +61,11 @@ async def _build_builtin_tools(
         try:
             tool = await spec.builder(ctx)
             if tool is not None:  # needs_config 但未配置时 builder 返回 None
+                tool.metadata = {
+                    **(tool.metadata or {}),
+                    TOOL_READ_ONLY_METADATA_KEY: spec.read_only,
+                    TOOL_CACHEABLE_METADATA_KEY: spec.cacheable,
+                }
                 tools.append(tool)
         except Exception as e:
             logger.warning("构建工具失败（跳过）: %s: %s", key, e)
@@ -79,9 +90,7 @@ async def build_enabled_tools(
         填充 tool_result 事件的 stats 字段（命中数/网页数等）。
     kb_ids: 知识库检索范围（已启用检索的库 id 列表），传给知识库工具；None=不限全部库。
     """
-    tools = await _build_builtin_tools(
-        session, user_id, citations, overrides, stats_holder, kb_ids
-    )
+    tools = await _build_builtin_tools(session, user_id, citations, overrides, stats_holder, kb_ids)
     # MCP 工具（⑥-B 接入，无状态版本）
     try:
         from app.core.agent.tools.mcp.loader import build_mcp_tools
@@ -113,9 +122,7 @@ async def build_enabled_tools_cm(
 
     MCP 模块不可用时，仅产出内置工具。
     """
-    tools = await _build_builtin_tools(
-        session, user_id, citations, overrides, stats_holder, kb_ids
-    )
+    tools = await _build_builtin_tools(session, user_id, citations, overrides, stats_holder, kb_ids)
     try:
         from app.core.agent.tools.mcp.loader import open_mcp_tools
     except ImportError:
@@ -125,23 +132,23 @@ async def build_enabled_tools_cm(
         yield [*tools, *mcp_tools]
 
 
-async def list_tools_for_user(
-    session: AsyncSession, user_id: uuid.UUID
-) -> list[dict]:
+async def list_tools_for_user(session: AsyncSession, user_id: uuid.UUID) -> list[dict]:
     """工具配置页用：列出全部内置工具定义 + 用户启停状态。"""
     enabled = await _enabled_map(session, user_id)
     out: list[dict] = []
     for key, spec in BUILTIN_REGISTRY.items():
-        out.append({
-            "tool_key": key,
-            "name": spec.name,
-            "description": spec.description,
-            "icon": spec.icon,
-            "tool_type": "builtin",
-            "needs_config": spec.needs_config,
-            "config_hint": spec.config_hint,
-            "enabled": enabled.get(key, spec.default_enabled),
-        })
+        out.append(
+            {
+                "tool_key": key,
+                "name": spec.name,
+                "description": spec.description,
+                "icon": spec.icon,
+                "tool_type": "builtin",
+                "needs_config": spec.needs_config,
+                "config_hint": spec.config_hint,
+                "enabled": enabled.get(key, spec.default_enabled),
+            }
+        )
     return out
 
 

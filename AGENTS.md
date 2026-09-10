@@ -52,14 +52,20 @@ uv run ruff check app tests
 
 涉及并发、重试、超时、缓存或状态迁移时，测试必须控制时序并断言后置状态，不能只靠大量随机重复。依赖 Redis、数据库或浏览器的测试应使用隔离命名空间和独立测试数据，不操作开发者现有数据。
 
-## 当前切片：S1 任务锁所有权
+## 当前切片：S2a 工具结果与缓存语义
 
-- 未取得租约的 worker 不得执行研究，也不得释放锁。
-- 每次获取使用独立 owner token；释放必须在 Redis 内原子比较 token 后删除。
-- 旧租约过期且新 owner 获锁后，旧 owner 的释放不得删除新锁。
-- 获取锁失败时禁止研究执行；释放失败或所有权丢失必须可观测，并保留 TTL 自愈。
-- 保持当前 Celery、任务 ID、Redis key、研究超时和业务报告流程不变。
-- 本切片不处理续租、fencing、持久派发、exactly-once、RAG、Memory、Verifier 或模型配置。
+- FC 与 ReAct 共用单次工具执行器；调用保留 `call_id`、真实工具名和完整结构化参数。
+- 工具结果必须显式区分 success/error；空结果是 success，业务失败和异常不得靠自然语言判断。
+- `tool_start`、`tool_result`、模型回灌与 trace 必须使用同一 outcome 语义和同一 `call_id`。
+- generic call cache 默认关闭；只有显式标记为可缓存的只读工具的成功结果可以进入单轮缓存。
+- 知识库和联网搜索为可缓存只读；时间为不可缓存只读；记忆搜索因命中后持久回写访问统计、
+  创建定时任务因写入业务数据，均声明为不可缓存写入。
+- 失败结果永不缓存；retryable 仅作可靠可判定的元数据，本切片不新增自动重试。
+- 保持现有 FC/ReAct 路由、事件兼容字段、Research 来源消费和群聊/单聊业务流程不变。
+- 本切片不处理 ReAct 多参数/schema、工具或模型参数纠错、Agent 最终终态、5 轮耗尽、
+  Skill/MCP 能力范围、MCP 生命周期、parallel tool calls 或新 Agent framework。
+- 工具超时预算、参数纠错预算、模型请求预算与总 deadline budget 属于 S2b 待完成 D2 项；
+  本切片不实现。MCP AsyncExitStack/session 生命周期与 MCP-specific 修复留给 S2c。
 
 ## Git 规则
 

@@ -3,10 +3,16 @@
 内置工具的「定义」在代码里用 ToolSpec 声明并注册到 BUILTIN_REGISTRY；
 用户对工具的「启停」存在 tool_configs 表。问答时按用户启停 + 本轮覆盖构建工具列表。
 """
+
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from langchain_core.tools import StructuredTool
+
+from app.core.agent.tool_contract import (
+    TOOL_CACHEABLE_METADATA_KEY,
+    TOOL_READ_ONLY_METADATA_KEY,
+)
 
 # 工具类型
 TOOL_TYPE_BUILTIN = "builtin"
@@ -44,6 +50,12 @@ class ToolSpec:
     needs_config: bool = False  # 是否需要额外配置（如联网需 websearch 模型）
     config_hint: str = ""  # 需要配置时的提示文案
     default_enabled: bool = True  # 默认是否启用
+    read_only: bool = False  # 是否不产生业务副作用
+    cacheable: bool = False  # 是否允许成功结果进入单轮通用调用缓存
+
+    def __post_init__(self) -> None:
+        if self.cacheable and not self.read_only:
+            raise ValueError("可缓存工具必须同时显式声明为只读")
 
 
 # 内置工具注册表：key -> ToolSpec
@@ -59,6 +71,8 @@ def register_tool(spec: ToolSpec) -> ToolSpec:
 __all__ = [
     "TOOL_TYPE_BUILTIN",
     "TOOL_TYPE_MCP",
+    "TOOL_READ_ONLY_METADATA_KEY",
+    "TOOL_CACHEABLE_METADATA_KEY",
     "ToolBuildContext",
     "ToolSpec",
     "BUILTIN_REGISTRY",
