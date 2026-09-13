@@ -4,11 +4,13 @@
 - fetch_tools_meta：test/sync 时调用，连单个 server 拉工具清单（原始 name/description）。
 单个 server 失败降级跳过，不影响其余 server 与内置工具。
 
-多 server 并行加载 + 单 server 超时，避免串行握手和挂死节点拖慢首包。
+非持久元数据按多 server 并行加载；持久会话按 server 串行建立，确保 MCP
+session 的进入和退出由同一个 asyncio task 完成。两条路径都有单 server 超时。
 
 工具名约束：OpenAI function calling 要求工具名匹配 ^[a-zA-Z0-9_-]+$ 且不超过 64 字符，
 故对 server 名与 MCP 原始工具名统一清洗（非法字符替换为 _），并去重。
 """
+
 import asyncio
 import re
 import time
@@ -41,10 +43,7 @@ _MCP_LOAD_TIMEOUT = min(CONNECT_TIMEOUT, 8.0)
 
 def _servers_fingerprint(servers: list[MCPServer]) -> str:
     """已启用 server 的指纹：id + updated_at，任一变化即缓存失效。"""
-    parts = [
-        f"{s.id}:{s.updated_at.isoformat() if s.updated_at else ''}"
-        for s in servers
-    ]
+    parts = [f"{s.id}:{s.updated_at.isoformat() if s.updated_at else ''}" for s in servers]
     return "|".join(sorted(parts))
 
 
@@ -92,17 +91,13 @@ def _collect_renamed(
     return tools
 
 
-async def build_mcp_tools(
-    session: AsyncSession, user_id: uuid.UUID
-) -> list[BaseTool]:
+async def build_mcp_tools(session: AsyncSession, user_id: uuid.UUID) -> list[BaseTool]:
     """构建该用户所有已启用 MCP server 的工具列表（名称清洗+去重）。
 
     多 server 并行加载；单 server 超时/失败跳过。
     带进程内 TTL 缓存：全部成功且指纹未变时复用，避免每轮重连握手。
     """
-    servers = await MCPServerRepository(session).list_by_user(
-        user_id, enabled_only=True
-    )
+    servers = await MCPServerRepository(session).list_by_user(user_id, enabled_only=True)
     if not servers:
         return []
 
@@ -122,11 +117,7 @@ async def build_mcp_tools(
     ok_items: list[tuple[MCPServer, list[BaseTool]]] = []
     for server, result in zip(servers, results, strict=True):
         if isinstance(result, BaseException):
-            err = (
-                f"超时(>{_MCP_LOAD_TIMEOUT:.0f}s)"
-                if isinstance(result, TimeoutError)
-                else result
-            )
+            err = f"超时(>{_MCP_LOAD_TIMEOUT:.0f}s)" if isinstance(result, TimeoutError) else result
             logger.warning("加载 MCP 工具失败（跳过）: %s: %s", server.name, err)
             continue
         ok_items.append((server, result))
@@ -153,25 +144,23 @@ async def build_mcp_tools(
 async def _open_one_server(
     server: MCPServer,
 ) -> tuple[AsyncExitStack, MCPServer, list[BaseTool]] | None:
-    """并行打开单个 server 的持久会话；失败返回 None 并自行清理。"""
+    """在当前 owner task 打开单个 server；失败时在同一 task 清理。"""
     local = AsyncExitStack()
     try:
-        conn = build_connection(server)
-        client = MultiServerMCPClient({str(server.id): conn})
-        mcp_session = await asyncio.wait_for(
-            local.enter_async_context(client.session(str(server.id))),
-            timeout=_MCP_LOAD_TIMEOUT,
-        )
-        raw = await asyncio.wait_for(
-            load_mcp_tools(mcp_session), timeout=_MCP_LOAD_TIMEOUT
-        )
+        async with asyncio.timeout(_MCP_LOAD_TIMEOUT):
+            conn = build_connection(server)
+            client = MultiServerMCPClient({str(server.id): conn})
+            mcp_session = await local.enter_async_context(client.session(str(server.id)))
+            raw = await load_mcp_tools(mcp_session)
         return local, server, raw
+    except asyncio.CancelledError:
+        try:
+            await local.aclose()
+        except Exception as close_err:  # noqa: BLE001
+            logger.warning("取消时关闭 MCP 会话出错（忽略）: %s", close_err)
+        raise
     except Exception as e:
-        err = (
-            f"超时(>{_MCP_LOAD_TIMEOUT:.0f}s)"
-            if isinstance(e, TimeoutError)
-            else e
-        )
+        err = f"超时(>{_MCP_LOAD_TIMEOUT:.0f}s)" if isinstance(e, TimeoutError) else e
         logger.warning("打开 MCP 会话失败（跳过）: %s: %s", server.name, err)
         try:
             await local.aclose()
@@ -188,29 +177,26 @@ async def open_mcp_tools(session: AsyncSession, user_id: uuid.UUID):
     本函数对每个 server 开一条**活着的 ClientSession**（整段 with 期间保持），其工具的
     每次调用都复用这条会话，不再重复握手——大幅降低多次工具调用的累计延迟。
 
-    多 server 并行开会话；单个失败跳过。退出时统一关闭。
+    多 server 串行开会话；单个失败跳过。退出时统一关闭。串行是刻意的：MCP/AnyIO
+    的 TaskGroup/CancelScope 要求 session 的进入与退出发生在同一个 owner task。
     """
-    servers = await MCPServerRepository(session).list_by_user(
-        user_id, enabled_only=True
-    )
+    servers = await MCPServerRepository(session).list_by_user(user_id, enabled_only=True)
     stack = AsyncExitStack()
     await stack.__aenter__()
     try:
         opened: list[tuple[AsyncExitStack, MCPServer, list[BaseTool]]] = []
         if servers:
             started = time.monotonic()
-            results = await asyncio.gather(
-                *[_open_one_server(s) for s in servers],
-            )
-            for item in results:
+            for server in servers:
+                item = await _open_one_server(server)
                 if item is None:
                     continue
                 local, server, raw = item
-                # 把子 stack 的清理挂到父 stack，with 结束时一并关闭
+                # 这里只转移清理回调，不转移 task；父子 stack 都由当前协程驱动。
                 stack.push_async_callback(local.aclose)
                 opened.append((local, server, raw))
             logger.info(
-                "MCP 持久会话并行打开完成: user=%s servers=%d ok=%d elapsed=%.2fs",
+                "MCP 持久会话串行打开完成: user=%s servers=%d ok=%d elapsed=%.2fs",
                 user_id,
                 len(servers),
                 len(opened),
@@ -240,10 +226,7 @@ async def fetch_tools_meta(server: MCPServer) -> list[dict]:
     抛出异常由调用方捕获并记入 server.last_error。
     """
     tools = await _load_raw_tools_timed(server)
-    return [
-        {"name": t.name, "description": (t.description or "")[:500]}
-        for t in tools
-    ]
+    return [{"name": t.name, "description": (t.description or "")[:500]} for t in tools]
 
 
 __all__ = ["build_mcp_tools", "open_mcp_tools", "fetch_tools_meta", "invalidate_mcp_cache"]

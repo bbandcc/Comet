@@ -52,26 +52,20 @@ uv run ruff check app tests
 
 涉及并发、重试、超时、缓存或状态迁移时，测试必须控制时序并断言后置状态，不能只靠大量随机重复。依赖 Redis、数据库或浏览器的测试应使用隔离命名空间和独立测试数据，不操作开发者现有数据。
 
-## 当前切片：S2b 参数、能力范围与停止原因
+## 当前切片：S2c MCP session lifecycle
 
-- FC 与 ReAct 必须经同一 schema 校验后才能构造 `ToolCall.validated_args` 并执行工具；校验失败
-  不执行，可在有界次数内回灌模型纠正。ReAct 支持 JSON object，并仅为单 `query` 工具保留
-  纯文本兼容。
-- builtin 与 MCP 合并后的最终工具集合必须统一经过 capability filtering；非空 Skill 白名单当前
-  只能授权明确列出的 builtin，因此保守拒绝并跳过加载 MCP。无 Skill 时保持用户原有启停配置。
-- Agent 终态固定为 `completed / failed / cancelled / budget_exhausted`，并携带
-  `stop_reason`；失败或预算耗尽可携带 `partial_answer`，ReAct 的 Thought/Action 协议文本不得成为
-  final 或 partial。单聊和群聊前端必须按终态收尾，不能把非 completed 显示为成功。
-- 独立限制单次工具 timeout、参数纠错次数、模型请求次数和总 deadline；时间判断使用 monotonic
-  clock。无工具流式模型同样受 deadline 约束，但下游 SSE/Redis 消费时间不计入模型等待预算。
-  S2a 的 `retryable` 只作元数据，不新增自动重试，写工具 timeout 后不得自动重试。
-- 单个 `ToolOutcome=error` 不等于 Agent failed；只要预算仍允许，就把明确错误回灌模型继续。
-- `tool_schema_invalid` 属于不可纠正的基础设施错误，必须直接 failed，不消耗参数纠错预算。
-- 单聊与群聊只最小同步终态、停止原因和 partial 持久化字段，不大改现有 SSE 事件协议。
-- 继续复用 S2a `ToolExecutor` 与既有 FC/ReAct 路由，不重设计 outcome/cache，不增加 parallel
-  tool calls、数据库表、Agent framework 或无关重构。
-- 本切片不修改 MCP `AsyncExitStack` / session ownership 或其他 lifecycle 行为（留给 S2c），
-  不处理 Research/Verifier/evidence（S3）、occurrence/checkpoint（S4）、Memory（S5）或 RAG（S6）。
+- 持久 MCP session 的 enter、工具加载和 exit 必须在同一个 owner task/协程内完成，不得把含
+  AnyIO TaskGroup/CancelScope 的上下文从子 task 移交给父 task 清理。
+- 初版按 server 串行建立持久会话；lifecycle-sensitive 路径不使用 `gather`、`create_task` 或
+  `wait_for`，单 server 超时使用当前 task 内的 `asyncio.timeout`。
+- 单 server 初始化失败或超时只跳过该 server；已经打开的会话在正常退出、失败和外部取消时
+  都必须关闭，`CancelledError` 必须继续传播。
+- 保留 MCP 工具命名、去重、降级语义和非持久 `build_mcp_tools` 行为；继续保持 S2a outcome/cache
+  与 S2b capability/terminal/budget 契约。
+- 单聊/群聊 `build_enabled_tools_cm` 与 Research `gather_mcp_sources` 必须共同使用修复后的
+  `open_mcp_tools`，不复制生命周期实现。
+- 本切片不升级 MCP adapter/SDK，不修改 Research evidence/source、Verifier、Memory、RAG、
+  checkpoint、parallel tool calls 或其他 S3+ 范围。
 
 ## Git 规则
 
