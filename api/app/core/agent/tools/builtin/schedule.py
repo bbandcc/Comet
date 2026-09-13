@@ -1,7 +1,6 @@
 """创建定时任务工具：对话里说"每天9点帮我查X"，Agent 调用本工具落一条定时研究任务。
 
-依赖 agent_tasks 表与调度（批次②）。只在支持 function calling 的强模型路径下有意义，
-弱模型默认不开（default_enabled=False）。
+依赖 agent_tasks 表与调度（批次②）。FC 与 ReAct 都通过真实参数 schema 校验后调用。
 """
 
 from langchain_core.tools import StructuredTool

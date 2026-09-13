@@ -21,7 +21,7 @@ import { chatApi } from '@/api/chat'
 import { copyText } from '@/utils/clipboard'
 import { AuthenticatedImage } from '@/components/AuthenticatedImage'
 import type { ChatAvatars, UiMessage } from './types'
-import { formatMsgTime, hasBubbleSep } from './types'
+import { AGENT_STATUS_LABEL, formatMsgTime, hasBubbleSep } from './types'
 
 export default function MessageItem({
   msg,
@@ -134,9 +134,11 @@ export default function MessageItem({
     return undefined
   })()
   const hasProcess = !isUser && (processRuns?.length ?? 0) > 0
+  const incompleteStatus =
+    msg.agentStatus && msg.agentStatus !== 'completed' ? msg.agentStatus : undefined
   // AI 流式中且还没出 content 时不渲染空气泡（过程组件已经表达了"在动"）
   const shouldRenderBubble =
-    isUser || (msg.content ? true : !msg.streaming && !hasProcess)
+    isUser || (msg.content ? true : !msg.streaming && !hasProcess && !incompleteStatus)
   // 全局真人模式：AI 回复走「正在输入…→逐条气泡」，不显示助手过程条（正在理解问题…）
   const humanModeActive = !!avatars?.humanMode
   const humanMode = !isUser && humanModeActive
@@ -156,6 +158,13 @@ export default function MessageItem({
     >
       {renderAvatar()}
       <div style={{ maxWidth: '82%', minWidth: 0 }}>
+        {!isUser && !msg.streaming && incompleteStatus && (
+          <Tooltip title={msg.stopReason}>
+            <Tag color={incompleteStatus === 'failed' ? 'error' : 'warning'}>
+              {AGENT_STATUS_LABEL[incompleteStatus]}
+            </Tag>
+          </Tooltip>
+        )}
         {/* AI 过程流：顶部进度线 + 状态条 + 工具 chip 行 + 可展开详情（真人模式不显示，改用「正在输入」气泡） */}
         {!isUser && !humanMode && (msg.streaming || hasProcess) && (
           <ChatProcess

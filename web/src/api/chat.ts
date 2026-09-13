@@ -23,6 +23,14 @@ export interface Citation {
   score: number | null
 }
 
+export type AgentStatus = 'completed' | 'failed' | 'cancelled' | 'budget_exhausted'
+
+export interface AgentTerminalData {
+  agent_status?: AgentStatus
+  stop_reason?: string
+  partial_answer?: string
+}
+
 export interface ToolCall {
   tool: string
   query: string
@@ -64,6 +72,9 @@ export interface ChatMessage {
     attachments?: { file_name: string; text?: string }[]
     image_keys?: string[]
     trace_id?: string  // 这一轮对话的执行轨迹 id(供「查看执行轨迹」按钮)
+    agent_status?: AgentStatus
+    stop_reason?: string
+    partial_answer?: string
   } | null
   feedback?: 'up' | 'down' | null
   created_at: string
@@ -94,7 +105,7 @@ export interface StreamHandlers {
   }) => void
   onToolCall?: (d: ToolCall) => void
   onCitation?: (citations: Citation[]) => void
-  onDone?: (d: {
+  onDone?: (d: AgentTerminalData & {
     conversation_id: string
     message_id?: string
     trace_id?: string
@@ -199,7 +210,10 @@ export interface GroupStreamHandlers {
     stats?: Record<string, unknown>
     latency_ms?: number
   }) => void
-  onSpeakerEnd?: (d: { persona_id: string; message_id: string }) => void
+  onSpeakerEnd?: (d: AgentTerminalData & {
+    persona_id: string
+    message_id: string | null
+  }) => void
   onDone?: (d: { conversation_id: string }) => void
   onError?: (message: string) => void
 }
@@ -307,7 +321,10 @@ export interface GroupRealtimeHandlers {
     stats?: Record<string, unknown>
     latency_ms?: number
   }) => void
-  onSpeakerEnd?: (d: { persona_id: string; message_id: string }) => void
+  onSpeakerEnd?: (d: AgentTerminalData & {
+    persona_id: string
+    message_id: string | null
+  }) => void
   onDone?: (d: { conversation_id: string }) => void
   onError?: (message: string) => void
 }

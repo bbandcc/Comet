@@ -53,10 +53,19 @@ class ToolExecutionError(Exception):
         self.artifact_ref = artifact_ref
 
 
+class ToolCallValidationError(ValueError):
+    """工具名或参数未通过共享校验；调用方可把错误回灌给模型纠正。"""
+
+    def __init__(self, message: str, *, error_code: str = "tool_validation_error") -> None:
+        super().__init__(message)
+        self.error_code = error_code
+
+
 __all__ = [
     "TOOL_CACHEABLE_METADATA_KEY",
     "TOOL_READ_ONLY_METADATA_KEY",
     "ToolCall",
+    "ToolCallValidationError",
     "ToolExecutionError",
     "ToolOutcome",
     "ToolStatus",

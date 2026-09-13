@@ -339,6 +339,9 @@ export default function ChatPage() {
           citations: m.meta_data?.citations,
           toolCalls: m.meta_data?.tool_calls,
           traceId: validTraceId(m.meta_data?.trace_id),
+          agentStatus: m.meta_data?.agent_status,
+          stopReason: m.meta_data?.stop_reason,
+          partialAnswer: m.meta_data?.partial_answer,
           images: m.images,
           attachments: m.meta_data?.attachments?.map((a) => ({
             file_name: a.file_name,
@@ -439,7 +442,11 @@ export default function ChatPage() {
           )
         },
         onDone: (d) => {
-          settleRunningToolRuns(resumeMsgId, 'success')
+          const agentStatus = d.agent_status ?? 'completed'
+          settleRunningToolRuns(
+            resumeMsgId,
+            agentStatus === 'completed' ? 'success' : 'error',
+          )
           setMessages((prev) =>
             prev.map((m) =>
               m.id === resumeMsgId
@@ -450,6 +457,10 @@ export default function ChatPage() {
                     conversationId: d.conversation_id,
                     createdAt: m.createdAt ?? new Date().toISOString(),
                     traceId: validTraceId(d.trace_id) ?? m.traceId,
+                    content: m.content || d.partial_answer || '',
+                    agentStatus,
+                    stopReason: d.stop_reason,
+                    partialAnswer: d.partial_answer,
                   }
                 : m,
             ),
@@ -481,6 +492,9 @@ export default function ChatPage() {
                               citations: last.meta_data?.citations,
                               toolCalls: last.meta_data?.tool_calls,
                               traceId: validTraceId(last.meta_data?.trace_id),
+                              agentStatus: last.meta_data?.agent_status,
+                              stopReason: last.meta_data?.stop_reason,
+                              partialAnswer: last.meta_data?.partial_answer,
                               conversationId: convId,
                               feedback: last.feedback ?? null,
                               createdAt: last.created_at,
@@ -551,6 +565,9 @@ export default function ChatPage() {
               citations: undefined,
               streaming: true,
               feedback: null,
+              agentStatus: undefined,
+              stopReason: undefined,
+              partialAnswer: undefined,
             }
           : m,
       ),
@@ -570,11 +587,21 @@ export default function ChatPage() {
         )
       },
       onDone: (d) => {
-        settleRunningToolRuns(aiId, 'success')
+        const agentStatus = d.agent_status ?? 'completed'
+        settleRunningToolRuns(aiId, agentStatus === 'completed' ? 'success' : 'error')
         setMessages((prev) =>
           prev.map((m) =>
             m.id === aiId
-              ? { ...m, streaming: false, id: d.message_id ?? m.id, createdAt: new Date().toISOString() }
+              ? {
+                  ...m,
+                  streaming: false,
+                  id: d.message_id ?? m.id,
+                  content: m.content || d.partial_answer || '',
+                  createdAt: new Date().toISOString(),
+                  agentStatus,
+                  stopReason: d.stop_reason,
+                  partialAnswer: d.partial_answer,
+                }
               : m,
           ),
         )
@@ -758,7 +785,11 @@ export default function ChatPage() {
           )
         },
         onDone: (d) => {
-          settleRunningToolRuns(aiMsg.id, 'success')
+          const agentStatus = d.agent_status ?? 'completed'
+          settleRunningToolRuns(
+            aiMsg.id,
+            agentStatus === 'completed' ? 'success' : 'error',
+          )
           setMessages((prev) =>
             prev.map((m) =>
               m.id === aiMsg.id
@@ -769,6 +800,10 @@ export default function ChatPage() {
                     conversationId: d.conversation_id,
                     createdAt: m.createdAt ?? new Date().toISOString(),
                     traceId: validTraceId(d.trace_id) ?? m.traceId,
+                    content: m.content || d.partial_answer || '',
+                    agentStatus,
+                    stopReason: d.stop_reason,
+                    partialAnswer: d.partial_answer,
                   }
                 : m,
             ),

@@ -1,4 +1,4 @@
-import type { Citation, ToolCall, ToolRun } from '@/api/chat'
+import type { AgentStatus, Citation, ToolCall, ToolRun } from '@/api/chat'
 
 // 前端消息模型（含流式中的临时状态）
 export interface UiMessage {
@@ -17,6 +17,15 @@ export interface UiMessage {
   createdAt?: string // 消息时间（ISO 字符串）
   fromHistory?: boolean // 来自历史加载（非本次实时生成）→ 真人模式多气泡不重放动画，直接全显
   traceId?: string // 这条 AI 消息所属对话回合的执行轨迹 id(供「执行轨迹」按钮跳转)
+  agentStatus?: AgentStatus
+  stopReason?: string
+  partialAnswer?: string
+}
+
+export const AGENT_STATUS_LABEL: Record<Exclude<AgentStatus, 'completed'>, string> = {
+  failed: '生成失败',
+  cancelled: '已取消',
+  budget_exhausted: '预算已耗尽',
 }
 
 // 对话头像上下文：是否显示 + AI（当前角色）头像 + 用户头像

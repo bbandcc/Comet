@@ -52,20 +52,26 @@ uv run ruff check app tests
 
 涉及并发、重试、超时、缓存或状态迁移时，测试必须控制时序并断言后置状态，不能只靠大量随机重复。依赖 Redis、数据库或浏览器的测试应使用隔离命名空间和独立测试数据，不操作开发者现有数据。
 
-## 当前切片：S2a 工具结果与缓存语义
+## 当前切片：S2b 参数、能力范围与停止原因
 
-- FC 与 ReAct 共用单次工具执行器；调用保留 `call_id`、真实工具名和完整结构化参数。
-- 工具结果必须显式区分 success/error；空结果是 success，业务失败和异常不得靠自然语言判断。
-- `tool_start`、`tool_result`、模型回灌与 trace 必须使用同一 outcome 语义和同一 `call_id`。
-- generic call cache 默认关闭；只有显式标记为可缓存的只读工具的成功结果可以进入单轮缓存。
-- 知识库和联网搜索为可缓存只读；时间为不可缓存只读；记忆搜索因命中后持久回写访问统计、
-  创建定时任务因写入业务数据，均声明为不可缓存写入。
-- 失败结果永不缓存；retryable 仅作可靠可判定的元数据，本切片不新增自动重试。
-- 保持现有 FC/ReAct 路由、事件兼容字段、Research 来源消费和群聊/单聊业务流程不变。
-- 本切片不处理 ReAct 多参数/schema、工具或模型参数纠错、Agent 最终终态、5 轮耗尽、
-  Skill/MCP 能力范围、MCP 生命周期、parallel tool calls 或新 Agent framework。
-- 工具超时预算、参数纠错预算、模型请求预算与总 deadline budget 属于 S2b 待完成 D2 项；
-  本切片不实现。MCP AsyncExitStack/session 生命周期与 MCP-specific 修复留给 S2c。
+- FC 与 ReAct 必须经同一 schema 校验后才能构造 `ToolCall.validated_args` 并执行工具；校验失败
+  不执行，可在有界次数内回灌模型纠正。ReAct 支持 JSON object，并仅为单 `query` 工具保留
+  纯文本兼容。
+- builtin 与 MCP 合并后的最终工具集合必须统一经过 capability filtering；非空 Skill 白名单当前
+  只能授权明确列出的 builtin，因此保守拒绝并跳过加载 MCP。无 Skill 时保持用户原有启停配置。
+- Agent 终态固定为 `completed / failed / cancelled / budget_exhausted`，并携带
+  `stop_reason`；失败或预算耗尽可携带 `partial_answer`，ReAct 的 Thought/Action 协议文本不得成为
+  final 或 partial。单聊和群聊前端必须按终态收尾，不能把非 completed 显示为成功。
+- 独立限制单次工具 timeout、参数纠错次数、模型请求次数和总 deadline；时间判断使用 monotonic
+  clock。无工具流式模型同样受 deadline 约束，但下游 SSE/Redis 消费时间不计入模型等待预算。
+  S2a 的 `retryable` 只作元数据，不新增自动重试，写工具 timeout 后不得自动重试。
+- 单个 `ToolOutcome=error` 不等于 Agent failed；只要预算仍允许，就把明确错误回灌模型继续。
+- `tool_schema_invalid` 属于不可纠正的基础设施错误，必须直接 failed，不消耗参数纠错预算。
+- 单聊与群聊只最小同步终态、停止原因和 partial 持久化字段，不大改现有 SSE 事件协议。
+- 继续复用 S2a `ToolExecutor` 与既有 FC/ReAct 路由，不重设计 outcome/cache，不增加 parallel
+  tool calls、数据库表、Agent framework 或无关重构。
+- 本切片不修改 MCP `AsyncExitStack` / session ownership 或其他 lifecycle 行为（留给 S2c），
+  不处理 Research/Verifier/evidence（S3）、occurrence/checkpoint（S4）、Memory（S5）或 RAG（S6）。
 
 ## Git 规则
 

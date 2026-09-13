@@ -44,6 +44,7 @@ import {
   groupApi,
   subscribeGroupEvents,
   type Conversation,
+  type AgentStatus,
   type GroupConversation,
   type GroupHuman,
   type GroupMember,
@@ -56,7 +57,13 @@ import { useAuthStore } from '@/stores/authStore'
 import { useGroupHeaderStore } from '@/stores/groupHeaderStore'
 import { copyText } from '@/utils/clipboard'
 import { favoriteApi } from '@/api/favorites'
-import { resolveToolMeta, formatMsgTime, splitBubbles, hasBubbleSep } from '@/pages/chat/types'
+import {
+  AGENT_STATUS_LABEL,
+  resolveToolMeta,
+  formatMsgTime,
+  splitBubbles,
+  hasBubbleSep,
+} from '@/pages/chat/types'
 import ShareModal from '@/pages/chat/ShareModal'
 
 // 群聊页内的消息模型（含流式态 + 发送者 + 工具调用标记）
@@ -96,6 +103,9 @@ interface GroupUiMessage {
   images?: string[]
   streaming?: boolean
   createdAt?: string
+  agentStatus?: AgentStatus
+  stopReason?: string
+  partialAnswer?: string
 }
 
 // 把后端群聊历史消息转成页面消息模型（openConversation 与重连 resync 复用）
@@ -108,7 +118,12 @@ type RawGroupMsg = {
   sender_user_id?: string | null
   is_me?: boolean
   images?: string[]
-  meta_data?: { tool_calls?: { tool: string; query?: string }[] } | null
+  meta_data?: {
+    tool_calls?: { tool: string; query?: string; status?: string }[]
+    agent_status?: AgentStatus
+    stop_reason?: string
+    partial_answer?: string
+  } | null
   created_at?: string | null
 }
 function toUiMessage(m: RawGroupMsg): GroupUiMessage {
@@ -122,10 +137,13 @@ function toUiMessage(m: RawGroupMsg): GroupUiMessage {
     isMe: m.is_me,
     images: m.images,
     createdAt: m.created_at ?? undefined,
+    agentStatus: m.meta_data?.agent_status,
+    stopReason: m.meta_data?.stop_reason,
+    partialAnswer: m.meta_data?.partial_answer,
     toolRuns: m.meta_data?.tool_calls?.map((t) => ({
       tool: t.tool,
       query: t.query,
-      status: 'success',
+      status: t.status ?? 'success',
     })),
   }
 }
@@ -555,12 +573,35 @@ export default function GroupChatPage() {
           }),
         )
       },
-      onSpeakerEnd: (d: { message_id: string }) => {
+      onSpeakerEnd: (d: {
+        message_id: string | null
+        agent_status?: AgentStatus
+        stop_reason?: string
+        partial_answer?: string
+      }) => {
         const cur = streamingRef.current
+        const agentStatus = d.agent_status ?? 'completed'
         setMessages((prev) =>
           prev.map((m) =>
             m.id === cur
-              ? { ...m, id: d.message_id, streaming: false, createdAt: new Date().toISOString() }
+              ? {
+                  ...m,
+                  id: d.message_id ?? m.id,
+                  content: m.content || d.partial_answer || '',
+                  streaming: false,
+                  createdAt: new Date().toISOString(),
+                  agentStatus,
+                  stopReason: d.stop_reason,
+                  partialAnswer: d.partial_answer,
+                  toolRuns: m.toolRuns?.map((run) =>
+                    run.status === 'running'
+                      ? {
+                          ...run,
+                          status: agentStatus === 'completed' ? 'success' : 'error',
+                        }
+                      : run,
+                  ),
+                }
               : m,
           ),
         )
@@ -1177,6 +1218,13 @@ export default function GroupChatPage() {
                   <PersonaAvatar name={name} avatarUrl={member?.avatar_url} size={38} />
                   <div className="gc-ai-block">
                     <div className="gc-sender-name">{name}</div>
+                    {!m.streaming && m.agentStatus && m.agentStatus !== 'completed' && (
+                      <Tooltip title={m.stopReason}>
+                        <Tag color={m.agentStatus === 'failed' ? 'error' : 'warning'}>
+                          {AGENT_STATUS_LABEL[m.agentStatus]}
+                        </Tag>
+                      </Tooltip>
+                    )}
                     {m.toolRuns && m.toolRuns.length > 0 && (() => {
                       const runs = dedupToolRuns(m.toolRuns)
                       const totalCalls = runs.reduce((s, r) => s + r.count, 0)
@@ -1235,7 +1283,7 @@ export default function GroupChatPage() {
                           <MarkdownMessage content={m.content} />
                         </div>
                       )
-                    ) : (
+                    ) : m.streaming ? (
                       <div className="gc-bubble gc-bubble--ai">
                         <span className="gc-typing">
                           <i />
@@ -1243,7 +1291,7 @@ export default function GroupChatPage() {
                           <i />
                         </span>
                       </div>
-                    )}
+                    ) : null}
                     {m.createdAt && !m.streaming && (
                       <div className="gc-ai-actions">
                         {m.content && (

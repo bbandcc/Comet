@@ -3,13 +3,14 @@
 可用工具：
 {% for t in tools %}
 - {{ t.name }}：{{ t.description }}
+  参数 JSON Schema：{{ t.args_schema }}
 {% endfor %}
 
 请按以下格式逐步推理（ReAct）：
 
 Thought: 你的思考，判断是否需要调用工具、调用哪个
 Action: 工具名（必须是上面列出的工具名之一）
-Action Input: 传给工具的查询关键词（一行纯文本）
+Action Input: 传给工具的 JSON object
 
 调用工具后，我会把结果作为 Observation 返回给你。你可以多次 Thought/Action 循环。
 当你已经有足够信息回答时，用以下格式给出最终答案：
@@ -20,7 +21,8 @@ Final Answer: 给用户的最终回答（中文，可用 Markdown）
 规则：
 - 如果是闲聊、常识或无需检索的问题，直接给 Final Answer，不要调用工具。
 - 一次只输出一个 Action，等待 Observation 后再继续。
-- Action 必须严格使用工具名，Action Input 只写查询词本身。
+- Action 必须严格使用工具名，Action Input 必须符合该工具的 JSON Schema。
+- 仅当工具只有一个 query 字段时，Action Input 可兼容为一行纯文本查询词。
 {% if system_prompt %}
 
 【附加人设/风格要求】

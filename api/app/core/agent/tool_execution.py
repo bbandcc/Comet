@@ -3,16 +3,23 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import json
 import time
 from dataclasses import replace
+from typing import Any
 
+from jsonschema import SchemaError as JsonSchemaError
+from jsonschema import ValidationError as JsonValidationError
+from jsonschema.validators import validator_for
 from langchain_core.tools import BaseTool
+from pydantic import BaseModel, ValidationError as PydanticValidationError
 
 from app.core.agent.tool_contract import (
     TOOL_CACHEABLE_METADATA_KEY,
     TOOL_READ_ONLY_METADATA_KEY,
     ToolCall,
+    ToolCallValidationError,
     ToolExecutionError,
     ToolOutcome,
 )
@@ -81,6 +88,79 @@ class ToolExecutor:
         self._cache: dict[str, ToolOutcome] = {}
 
     @staticmethod
+    def _supports_plain_query(tool: BaseTool) -> bool:
+        schema = tool.args_schema or tool.get_input_schema()
+        if isinstance(schema, dict):
+            return set(schema.get("properties", {})) == {"query"}
+        if isinstance(schema, type) and issubclass(schema, BaseModel):
+            return set(schema.model_fields) == {"query"}
+        return False
+
+    @staticmethod
+    def _validate_pydantic_args(schema: type[BaseModel], args: dict[str, Any]) -> dict[str, Any]:
+        result = schema.model_validate(args)
+        values = result.model_dump()
+        validated: dict[str, Any] = {}
+        for key, value in values.items():
+            field = schema.model_fields[key]
+            if key in args or not field.is_required():
+                validated[key] = value
+        return validated
+
+    @staticmethod
+    def _validate_json_schema_args(schema: dict, args: dict[str, Any]) -> dict[str, Any]:
+        validator_type = validator_for(schema)
+        validator_type.check_schema(schema)
+        validator_type(schema).validate(args)
+        return dict(args)
+
+    def validate_call(
+        self,
+        call_id: str,
+        tool_key: str,
+        raw_args: object,
+        *,
+        allow_plain_query: bool = False,
+    ) -> ToolCall:
+        """解析并校验一次调用；成功后才构造含 validated_args 的 ToolCall。"""
+        tool = self._tools.get(tool_key)
+        if tool is None:
+            raise ToolCallValidationError(f"未知工具：{tool_key}", error_code="unknown_tool")
+
+        args = raw_args
+        if isinstance(args, str) and allow_plain_query:
+            text = args.strip()
+            if text.startswith(("{", "[")):
+                try:
+                    args = json.loads(text)
+                except json.JSONDecodeError as exc:
+                    raise ToolCallValidationError(f"工具参数不是有效 JSON：{exc.msg}") from exc
+            elif self._supports_plain_query(tool):
+                args = {"query": text}
+
+        if not isinstance(args, dict):
+            raise ToolCallValidationError("工具参数必须是 JSON object")
+
+        schema = tool.args_schema
+        try:
+            if isinstance(schema, dict):
+                validated_args = self._validate_json_schema_args(schema, args)
+            elif isinstance(schema, type) and issubclass(schema, BaseModel):
+                validated_args = self._validate_pydantic_args(schema, args)
+            else:
+                input_schema = tool.get_input_schema()
+                validated_args = self._validate_pydantic_args(input_schema, args)
+        except (PydanticValidationError, JsonValidationError) as exc:
+            raise ToolCallValidationError(f"工具参数校验失败：{exc}") from exc
+        except JsonSchemaError as exc:
+            raise ToolCallValidationError(
+                f"工具参数 schema 无效：{exc.message}",
+                error_code="tool_schema_invalid",
+            ) from exc
+
+        return ToolCall(call_id=call_id, tool_key=tool_key, validated_args=validated_args)
+
+    @staticmethod
     def _policy(tool: BaseTool) -> tuple[bool, bool]:
         metadata = tool.metadata or {}
         read_only = metadata.get(TOOL_READ_ONLY_METADATA_KEY) is True
@@ -101,7 +181,13 @@ class ToolExecutor:
             return None
         return f"{call.tool_key}:{args}"
 
-    async def execute(self, call: ToolCall, *, attempt: int = 1) -> ToolOutcome:
+    async def execute(
+        self,
+        call: ToolCall,
+        *,
+        attempt: int = 1,
+        timeout_seconds: float | None = None,
+    ) -> ToolOutcome:
         started = time.monotonic()
         tool = self._tools.get(call.tool_key)
         read_only = False
@@ -133,7 +219,11 @@ class ToolExecutor:
                 )
             else:
                 try:
-                    raw = await tool.ainvoke(call.validated_args)
+                    if timeout_seconds is None:
+                        raw = await tool.ainvoke(call.validated_args)
+                    else:
+                        async with asyncio.timeout(timeout_seconds):
+                            raw = await tool.ainvoke(call.validated_args)
                 except ToolExecutionError as exc:
                     outcome = ToolOutcome(
                         status="error",
@@ -198,6 +288,7 @@ __all__ = [
     "TOOL_CACHEABLE_METADATA_KEY",
     "TOOL_READ_ONLY_METADATA_KEY",
     "ToolCall",
+    "ToolCallValidationError",
     "ToolExecutionError",
     "ToolExecutor",
     "ToolOutcome",

@@ -21,6 +21,7 @@ from contextlib import AsyncExitStack
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.agent.agent_contract import AgentTerminal
 from app.core.agent.group_chat import (
     build_speaker_messages,
     build_transcript,
@@ -722,6 +723,9 @@ class GroupChatService:
             )
             full_text = ""
             tool_calls: list[dict] = []
+            agent_status = "completed"
+            stop_reason = "direct_answer"
+            partial_answer = ""
             try:
                 async for ev in self._speak(
                     speaker_model,
@@ -754,16 +758,41 @@ class GroupChatService:
                             "tool_result",
                             _tool_event_data(ev),
                         )
-                    elif ev["type"] == "final" and not full_text:
-                        full_text = ev["text"]
+                    elif ev["type"] == "final":
+                        agent_status = ev.get("status", "completed")
+                        stop_reason = ev.get("stop_reason", "final_answer")
+                        partial_answer = ev.get("partial_answer", "")
+                        if agent_status == "completed":
+                            if not full_text:
+                                full_text = ev.get("text", "")
+                        elif not full_text:
+                            full_text = partial_answer
             except Exception as e:
                 logger.warning("群成员发言失败（跳过）: %s err=%s", name, e)
                 continue
 
             full_text = full_text.strip()
             if not full_text:
+                if agent_status != "completed":
+                    await bus.publish(
+                        cid,
+                        "speaker_end",
+                        {
+                            "persona_id": member["id"],
+                            "message_id": None,
+                            "agent_status": agent_status,
+                            "stop_reason": stop_reason,
+                            "partial_answer": partial_answer,
+                        },
+                    )
                 continue
-            meta: dict = {"sender_name": member["name"]}
+            meta: dict = {
+                "sender_name": member["name"],
+                "agent_status": agent_status,
+                "stop_reason": stop_reason,
+            }
+            if partial_answer and agent_status != "completed":
+                meta["partial_answer"] = partial_answer
             if tool_calls:
                 meta["tool_calls"] = tool_calls
             msg = await self.msg_repo.add(
@@ -779,7 +808,13 @@ class GroupChatService:
             await bus.publish(
                 cid,
                 "speaker_end",
-                {"persona_id": member["id"], "message_id": str(msg.id)},
+                {
+                    "persona_id": member["id"],
+                    "message_id": str(msg.id),
+                    "agent_status": agent_status,
+                    "stop_reason": stop_reason,
+                    "partial_answer": partial_answer,
+                },
             )
 
         await self.conv_repo.touch(conv_id)
@@ -940,6 +975,9 @@ class GroupChatService:
             )
             full_text = ""
             tool_calls: list[dict] = []
+            agent_status = "completed"
+            stop_reason = "direct_answer"
+            partial_answer = ""
             try:
                 async for ev in self._speak(
                     speaker_model,
@@ -960,17 +998,41 @@ class GroupChatService:
                     elif ev["type"] == "tool_result":
                         _finish_tool_call(tool_calls, ev)
                         yield _sse("tool_result", _tool_event_data(ev))
-                    elif ev["type"] == "final" and not full_text:
-                        full_text = ev["text"]
+                    elif ev["type"] == "final":
+                        agent_status = ev.get("status", "completed")
+                        stop_reason = ev.get("stop_reason", "final_answer")
+                        partial_answer = ev.get("partial_answer", "")
+                        if agent_status == "completed":
+                            if not full_text:
+                                full_text = ev.get("text", "")
+                        elif not full_text:
+                            full_text = partial_answer
             except Exception as e:
                 logger.warning("群成员发言失败（跳过）: %s err=%s", name, e)
                 continue
 
             full_text = full_text.strip()
             if not full_text:
+                if agent_status != "completed":
+                    yield _sse(
+                        "speaker_end",
+                        {
+                            "persona_id": member["id"],
+                            "message_id": None,
+                            "agent_status": agent_status,
+                            "stop_reason": stop_reason,
+                            "partial_answer": partial_answer,
+                        },
+                    )
                 continue
             # 落库该角色发言（sender_name + 工具调用存进 meta_data 供历史还原）
-            meta: dict = {"sender_name": member["name"]}
+            meta: dict = {
+                "sender_name": member["name"],
+                "agent_status": agent_status,
+                "stop_reason": stop_reason,
+            }
+            if partial_answer and agent_status != "completed":
+                meta["partial_answer"] = partial_answer
             if tool_calls:
                 meta["tool_calls"] = tool_calls
             msg = await self.msg_repo.add(
@@ -986,7 +1048,13 @@ class GroupChatService:
             transcript = transcript + f"\n【{member['name']}】{full_text}"
             yield _sse(
                 "speaker_end",
-                {"persona_id": member["id"], "message_id": str(msg.id)},
+                {
+                    "persona_id": member["id"],
+                    "message_id": str(msg.id),
+                    "agent_status": agent_status,
+                    "stop_reason": stop_reason,
+                    "partial_answer": partial_answer,
+                },
             )
 
         await self.conv_repo.touch(conv.id)
@@ -1052,6 +1120,7 @@ class GroupChatService:
 
         # 纯人设、无图：直接流式
         if not tools and not image_parts:
+            answer_parts: list[str] = []
             async for token in stream_speaker(
                 model,
                 member["system_prompt"],
@@ -1060,7 +1129,13 @@ class GroupChatService:
                 transcript,
                 human_mode=human_mode,
             ):
+                answer_parts.append(token)
                 yield {"type": "token", "text": token}
+            yield AgentTerminal(
+                "completed",
+                "final_answer",
+                final_answer="".join(answer_parts),
+            ).as_event()
             return
 
         # 构造本轮 user 消息：带图时用多模态内容块（文字 + 图）
@@ -1078,12 +1153,19 @@ class GroupChatService:
                     SystemMessage(content=system_prompt),
                     HumanMessage(content=human_content),
                 ]
+                answer_parts = []
                 async for chunk in model.astream(messages):
                     if chunk.content:
                         text = (
                             chunk.content if isinstance(chunk.content, str) else str(chunk.content)
                         )
+                        answer_parts.append(text)
                         yield {"type": "token", "text": text}
+                yield AgentTerminal(
+                    "completed",
+                    "final_answer",
+                    final_answer="".join(answer_parts),
+                ).as_event()
                 return
             async for ev in run_react(
                 model,
@@ -1113,10 +1195,17 @@ class GroupChatService:
             SystemMessage(content=system_prompt),
             HumanMessage(content=human_content),
         ]
+        answer_parts = []
         async for chunk in model.astream(messages):
             if chunk.content:
                 text = chunk.content if isinstance(chunk.content, str) else str(chunk.content)
+                answer_parts.append(text)
                 yield {"type": "token", "text": text}
+        yield AgentTerminal(
+            "completed",
+            "final_answer",
+            final_answer="".join(answer_parts),
+        ).as_event()
 
 
 __all__ = ["GroupChatService"]

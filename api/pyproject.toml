@@ -45,6 +45,7 @@ dependencies = [
     "langchain-openai>=1.2.2",
     "langchain-core>=1.4.0",
     "langchain-mcp-adapters>=0.2.2",
+    "jsonschema==4.26.0",
     "json-repair>=0.60.1",
     # ===== 评测：HuggingFace datasets（仅 eval/ 用到，但放主依赖便于 uv 同步） =====
     "datasets>=3.2.0",

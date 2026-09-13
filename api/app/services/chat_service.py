@@ -15,6 +15,7 @@ from collections.abc import AsyncGenerator
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.agent.agent_contract import AgentTerminal
 from app.core.agent.orchestrator import run_function_calling, run_react
 from app.core.agent.tools import build_enabled_tools
 from app.core.agent.tracing import get_tracer, push_llm_usage
@@ -284,14 +285,15 @@ class ChatService:
 
     async def _tool_scope(
         self, user_id: uuid.UUID, body: ChatStreamRequest, skill=None
-    ) -> tuple[dict[str, bool], list[str] | None]:
-        """计算本轮工具的 overrides（启停覆盖）与知识库检索范围 kb_ids。
+    ) -> tuple[dict[str, bool], list[str] | None, set[str] | None]:
+        """计算工具启停、知识库范围与最终 Skill 能力白名单。
 
         - 对话页本轮临时开关（联网/知识库/记忆）作为 override，优先级最高。
         - 技能 tool_keys 非空 → 工具白名单（只开白名单内的）。
         - 知识库范围：技能绑库优先，否则取用户「已启用检索」的库集合。
         """
         overrides: dict[str, bool] = {}
+        allowed_tool_keys: set[str] | None = None
         if body.enable_knowledge is not None:
             overrides["knowledge_search"] = body.enable_knowledge
         if body.enable_memory is not None:
@@ -303,6 +305,8 @@ class ChatService:
             from app.core.agent.tools.base import BUILTIN_REGISTRY
 
             whitelist = set(skill.tool_keys)
+            # Skill schema 当前只表达 builtin key；非空白名单时保守拒绝全部 MCP。
+            allowed_tool_keys = whitelist.intersection(BUILTIN_REGISTRY)
             for key in BUILTIN_REGISTRY:
                 overrides[key] = key in whitelist
 
@@ -314,7 +318,7 @@ class ChatService:
             kb_ids: list[str] | None = [str(skill.kb_id)]
         else:
             kb_ids = await KnowledgeBaseRepository(self.session).list_chat_enabled_ids(user_id)
-        return overrides, kb_ids
+        return overrides, kb_ids, allowed_tool_keys
 
     async def _build_tools(
         self,
@@ -330,7 +334,7 @@ class ChatService:
         工具启停统一由「工具配置页」(tool_configs) 管理，这里不再读 agent 的工具开关；
         仅把对话页本轮的临时开关（如联网）作为 override 传入，优先级最高。
         """
-        overrides, kb_ids = await self._tool_scope(user_id, body, skill)
+        overrides, kb_ids, allowed_tool_keys = await self._tool_scope(user_id, body, skill)
         return await build_enabled_tools(
             self.session,
             user_id,
@@ -338,6 +342,7 @@ class ChatService:
             overrides,
             stats_holder=stats_holder,
             kb_ids=kb_ids,
+            allowed_tool_keys=allowed_tool_keys,
         )
 
     async def stream_chat(
@@ -494,6 +499,9 @@ class ChatService:
         full_text = ""
         tool_calls: list[dict] = []
         citations: list[dict] = []
+        agent_status = "completed"
+        stop_reason = "direct_answer"
+        partial_answer = ""
         n = 0
         # 真实采样到的 trace_id；noop/关闭 tracing 时保持 None，避免写入全 0 UUID
         trace_id_str: str | None = None
@@ -579,8 +587,15 @@ class ChatService:
                                 "tool_result",
                                 event_data,
                             )
-                        elif etype == "final" and not full_text:
-                            full_text = ev["text"]
+                        elif etype == "final":
+                            agent_status = ev.get("status", "completed")
+                            stop_reason = ev.get("stop_reason", "final_answer")
+                            partial_answer = ev.get("partial_answer", "")
+                            if agent_status == "completed":
+                                if not full_text:
+                                    full_text = ev.get("text", "")
+                            elif not full_text:
+                                full_text = partial_answer
                         elif etype == "citation":
                             citations = ev["citations"]
                             await bus.publish(cid, "citation", {"citations": citations})
@@ -590,7 +605,11 @@ class ChatService:
                     meta: dict = {
                         "citations": citations,
                         "tool_calls": tool_calls,
+                        "agent_status": agent_status,
+                        "stop_reason": stop_reason,
                     }
+                    if partial_answer and agent_status != "completed":
+                        meta["partial_answer"] = partial_answer
                     if trace_id_str:
                         meta["trace_id"] = trace_id_str
                     assistant_msg = await svc.msg_repo.add(
@@ -615,15 +634,37 @@ class ChatService:
                 done_payload: dict = {
                     "conversation_id": cid,
                     "message_id": str(assistant_msg.id),
+                    "agent_status": agent_status,
+                    "stop_reason": stop_reason,
+                    "partial_answer": partial_answer,
                 }
                 if trace_id_str:
                     done_payload["trace_id"] = trace_id_str
                 await bus.publish(cid, "done", done_payload)
+        except asyncio.CancelledError:
+            await asyncio.shield(
+                self._save_partial_on_error(
+                    conv_id,
+                    full_text,
+                    citations,
+                    tool_calls,
+                    trace_id=trace_id_str,
+                    agent_status="cancelled",
+                    stop_reason="external_cancellation",
+                )
+            )
+            raise
         except Exception as e:
             logger.error("问答后台生成失败: conv=%s err=%s", cid, e, exc_info=True)
             # 已生成部分内容也落库，避免完全丢失
             await self._save_partial_on_error(
-                conv_id, full_text, citations, tool_calls, trace_id=trace_id_str
+                conv_id,
+                full_text,
+                citations,
+                tool_calls,
+                trace_id=trace_id_str,
+                agent_status="failed",
+                stop_reason="unhandled_generation_error",
             )
             await bus.clear_stream_buffer(cid)
             await bus.publish(cid, "error", {"message": f"生成失败：{e}"})
@@ -687,10 +728,17 @@ class ChatService:
         if body.image_keys:
             # 多模态输入：用多模态模型看图回答（不走工具编排，无需 MCP 会话）
             system_prompt = await _assemble_prompt(has_tools=False)
+            answer_parts: list[str] = []
             async for token in self._stream_multimodal(
                 user_id, system_prompt, history, composed_text, body.image_keys
             ):
+                answer_parts.append(token)
                 yield {"type": "token", "text": token}
+            yield AgentTerminal(
+                "completed",
+                "final_answer",
+                final_answer="".join(answer_parts),
+            ).as_event()
             if citations:
                 yield {"type": "citation", "citations": citations}
             return
@@ -699,26 +747,26 @@ class ChatService:
         # 用无状态 build_enabled_tools（而非每轮预开 MCP 会话的 _cm 版）：MCP 工具清单走
         # 进程内缓存、不预握手，只有模型真正调用某个 MCP 工具时才连接——闲聊/只用内置工具
         # 的轮次零 MCP 握手，大幅降低首字延迟。
-        overrides, kb_ids = await self._tool_scope(user_id, body, skill)
+        overrides, kb_ids, allowed_tool_keys = await self._tool_scope(user_id, body, skill)
         tools = await build_enabled_tools(
-            self.session, user_id, citations, overrides, stats_holder, kb_ids
+            self.session,
+            user_id,
+            citations,
+            overrides,
+            stats_holder,
+            kb_ids,
+            allowed_tool_keys=allowed_tool_keys,
         )
         system_prompt = await _assemble_prompt(has_tools=bool(tools))
         if not tools:
-            # 无工具：纯流式（仍包一层 llm_call span，保证「执行轨迹」有内容：模型/耗时/token）
+            # 无工具也复用 Agent 终态/模型请求/deadline 契约；编排器会保持直接流式。
             lc_messages: list = []
             if system_prompt:
                 lc_messages.append(SystemMessage(content=system_prompt))
             lc_messages.extend(history)
             lc_messages.append(HumanMessage(content=composed_text))
-            tracer = get_tracer()
-            async with tracer.llm_span(f"对话:{config.model_name}", model_name=config.model_name):
-                agg = None
-                async for chunk in model.astream(lc_messages):
-                    agg = chunk if agg is None else agg + chunk
-                    if chunk.content:
-                        yield {"type": "token", "text": chunk.content}
-                push_llm_usage(agg, model)  # 有 usage_metadata 则记 token/成本，无则仅记耗时
+            async for ev in run_function_calling(model, [], lc_messages):
+                yield ev
         elif supports_function_call(config):
             # 强模型：原生 function calling
             lc_messages = []
@@ -752,6 +800,8 @@ class ChatService:
         citations: list[dict],
         tool_calls: list[dict],
         trace_id: str | None = None,
+        agent_status: str = "failed",
+        stop_reason: str = "unhandled_generation_error",
     ) -> None:
         """后台生成异常时，把已生成的部分回复落库，避免完全丢失。失败只记 warning。"""
         text = (full_text or "").strip()
@@ -762,6 +812,9 @@ class ChatService:
                 "citations": citations,
                 "tool_calls": tool_calls,
                 "interrupted": True,
+                "agent_status": agent_status,
+                "stop_reason": stop_reason,
+                "partial_answer": text,
             }
             if trace_id:
                 meta["trace_id"] = trace_id
