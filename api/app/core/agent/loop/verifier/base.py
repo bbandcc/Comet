@@ -2,6 +2,7 @@
 
 子类必须实现 `verify()`,返回 VerifyScore(原始分 + 加权总分 + 结构化反馈)。
 """
+
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
@@ -10,10 +11,18 @@ from typing import Any
 from app.core.agent.loop.models import RubricDef, VerifyScore
 
 
+class JudgeError(RuntimeError):
+    """Judge 调用或输出无法形成可信质量分。"""
+
+
+class VerifierUnavailableError(RuntimeError):
+    """请求的 verifier 配置或运行依赖不可用。"""
+
+
 class Verifier(ABC):
     """Verifier 抽象:接收 artifact + rubric → 输出 VerifyScore。"""
 
-    # 标识 verifier 类型,落库到 loop_runs.verifier_kind(同模型基线 / 跨模型异源)
+    # 标识 verifier 类型,落库到 loop_runs.verifier_kind(同模型基线 / 独立配置)
     kind: str = "base"
     # 标识 verifier 使用的 LLM 模型名(可选,落库到 loop_runs.verifier_model)
     model_name: str = ""

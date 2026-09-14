@@ -1,14 +1,14 @@
-# 公共评测基准(C-MTEB + HotpotQA)+ Verifier A/B 实验 — 设计与面试
+# 公共评测基准(C-MTEB + HotpotQA)+ Verifier 历史探索性快照 — 设计与面试
 
-> 自制集证明「场景可用」,公共基准证明「业界水平」。引入 C-MTEB(中文检索)+ HotpotQA distractor(多跳推理)两套业界公认基准,把指标对标到可比基线,同时用 HotpotQA 给 ② Verifier Loop 跑严格 A/B 实验。
+> 自制集验证项目场景,公共基准提供可比较的检索与多跳问答指标。HotpotQA 的历史 verifier 小样本仅作探索记录，不用于证明 verifier 类型优劣。
 > 对应能力域:**评测体系**(公共基准层)。代码:`api/eval/benchmarks/{cmteb_t2,hotpotqa}/`。
 
 ---
 
 ## 0. 能力定位(对应招聘要求)
 
-- 对应 JD:**「LLM 评测」「公共基准」「C-MTEB / MTEB」「HotpotQA」「LLM-as-judge」「A/B 实验」**。
-- 角色:把 ① 自制集的「**场景可用**」升级到「**业界水平**」,并为 ② Verifier Loop 提供数据驱动的工程决策证据(为什么不能 self-critique)。
+- 对应 JD:**「LLM 评测」「公共基准」「C-MTEB / MTEB」「HotpotQA」「LLM-as-judge」**。
+- 角色:记录公共基准结果，并保留当时 same / cross 配置下的 verifier 小样本探索；后者不作为生产选型证明。
 
 ---
 
@@ -23,7 +23,7 @@ V0.0.5 ① 跑出来 RAG Recall@5=1.0 / 记忆 Recall@5=0.82,数据漂亮但**�
 ```
 L1 应用层(自制中文集,① 完成)         证明:产品自洽 + 记忆评测的事实来源(中文)
 L2 中文检索基准(C-MTEB T2Retrieval)    证明:通用检索能力(对标 bge-m3 等业界基线)
-L3 多跳推理(HotpotQA distractor)       证明:端到端 RAG + Verifier same/cross A/B
+L3 多跳推理(HotpotQA distractor)       验证:端到端 RAG；另保留 verifier 探索性快照
 ```
 
 > **原计划的 L4 LongMemEval 已下架**(EMNLP 2024 英文长对话记忆基准):本项目记忆萃取流水线**中文优先**(`core/memory/prompts/*.jinja2` 全中文 + 13 类中文实体/谓词词表),英文输入产生翻译噪声,实测 oracle 2 题全 0。**「不卖做不到的事」是工程判断,本身亦为面试加分项**——能砍掉本来计划做的事比加上去更难。
@@ -43,7 +43,7 @@ flowchart TD
   HR -.可选.-> V{--verifier}
   V -->|none| M2
   V -->|same| QV[qa_verifier<br/>同模型 self-critique]
-  V -->|cross| QV2[qa_verifier<br/>跨家族 deepseek+glm]
+  V -->|cross| QV2[qa_verifier<br/>独立 verifier 配置]
   QV & QV2 --> M3[judge 通过率 / 漏检率 / 与 EM 一致率]
   M1 & M2 & M3 --> REP[results/{rag,memory}/<br/>report-*.md]
 ```
@@ -117,7 +117,7 @@ api/eval/benchmarks/
 | F1 | **74.49%** |
 | Recall@4 | **95.75%** |
 
-### 3.4 Verifier A/B 实验(20 题/组)
+### 3.4 历史 Verifier 探索性快照(20 题/组)
 
 `--verifier {none,same,cross}` 三组对照,统计:
 
@@ -127,12 +127,10 @@ api/eval/benchmarks/
 
 | 配置 | verifier 模型 | judge 通过率 | EM 一致率 |
 |------|-------------|------------|----------|
-| **same**(self-critique) | deepseek-v3 自评 | **0%** ⚠ | 40% |
-| **cross**(跨家族) | deepseek-v3 应答 + glm-4-flash 审稿 | **95%** ⭐ | **65%** |
+| **same**(当时同模型配置) | deepseek-v3 自评 | **0%** | 40% |
+| **cross**(当时独立配置) | deepseek-v3 应答 + glm-4-flash 审稿 | **95%** | **65%** |
 
-**结论**:
-- **self-critique 完全不可用**(同模型偏向认同自己,judge 通过率 0%)
-- **跨家族独立审稿才是数据驱动的工程必选**——这是 ② Verifier Loop「优先 cross,fallback same」决策的实证基础
+这组小样本只记录当时配置下的探索结果，不能证明某种 verifier 普遍更好，也不用于推断当前生产配置的模型 family。
 
 ---
 
@@ -142,7 +140,7 @@ api/eval/benchmarks/
 2. **每题独立 user_id 命名空间**(uuid5):HotpotQA 单题灌入 → 评测 → 立刻清,**题间零干扰、可重入**
 3. **复用同一 metrics 模块**(P/R/F1 / Recall@k / MRR / nDCG / 分层采样),不重复造轮子
 4. **诚实污染声明**:HotpotQA dev 2018 年发布,主流 LLM 可能见过,只作系统设计对比,不作绝对水平断言 —— **这种诚实性反而加分**
-5. **Verifier A/B 实验设计**:同一份 runner 加 `--verifier` 参数,one-knob 切换,三组对照真出数据
+5. **Verifier 对照入口**:同一份 runner 可用 `--verifier` 切换 none / same / cross，历史小样本仅作探索记录
 6. **results 按 rag / memory 拆子目录**:`results/rag/`(C-MTEB + HotpotQA + 自制 RAG)/ `results/memory/`(自制记忆三任务),按系统组织而非按 benchmark 组织,更接近开发者视角
 
 ---
@@ -153,8 +151,8 @@ api/eval/benchmarks/
 |------|-----|------|
 | 接入 LongMemEval(英文) | **不接** | 实测 oracle 2 题全 0,中文优先项目硬上数据难看,**砍掉而非硬上** |
 | C-MTEB 跑全量(N>1w) | **跑 subset 300/30** | HF 数据流量大、单机算力有限;subset 已能体现配置差异 |
-| HotpotQA 跑 7405 题(完整 dev) | **跑 200 题 baseline + 20 题 A/B** | 单题灌入 + 评测耗时大,200 + 20 已足够出统计显著结果 |
-| Verifier 用什么模型 | same=同 chat 模型 / cross=deepseek + glm 跨家族 | 用项目主要会用的开源中文模型,符合实战场景 |
+| HotpotQA 跑 7405 题(完整 dev) | **跑 200 题 baseline + 20 题探索样本** | 单题灌入 + 评测耗时大；20 题结果只作探索记录，不宣称统计结论 |
+| Verifier 用什么模型 | same=同 chat 模型 / cross=独立 verifier 配置 | cross 描述配置来源，不代表已验证模型 family |
 | 是否对污染做去重 | **诚实声明,不作绝对断言** | 主流 LLM 可能见过 HotpotQA 2018 dev,只作系统设计对比,声明诚实性 > 假装无污染 |
 
 ---
@@ -164,7 +162,7 @@ api/eval/benchmarks/
 - **HF 数据集路径变更**:`C-MTEB/T2Retrieval` → `mteb/T2Retrieval`(MMTEB 迁移),子配置的 split 全是 `dev`(不再 corpus/queries 同名)。loader 必须兼容,否则会报 `'corpus' not found. Available: ['default']` / `Unknown split "corpus". Should be one of ['dev']`
 - **HotpotQA dev 评测必须用官方 normalize**:小写 / 去标点 / 去冠词 / 空白归一化;直接字符串相等会偏低 5~10 个百分点,所有 baseline 论文都用这套口径
 - **rerank 在小语料下伤害**:cmteb-t2 300 篇语料 nDCG@10 从 0.9818 降到 0.9777——rerank 在小且语义清晰的语料上**多此一举**,生产大语料才能反转。这是一个有趣的反直觉发现,值得讲。
-- **`--verifier same` 的失效现象**:judge 通过率 0% 看起来像 bug,实际是 self-critique 的真实失效——同模型 prompt 倾向于自圆其说。**这是 V0.0.5 ② 决策的硬数据,务必记录**。
+- **历史 verifier 小样本**:`same` 的 0% 与 `cross` 的 95% 只描述当时 20 题和具体配置，不证明 self-critique 真实失效，也不外推当前 production 模型或模型 family。
 - **诚实污染声明**:HotpotQA 2018 年发布,主流 LLM 训练时可能见过 gold 答案。我们的指标只反映「系统设计 + 检索质量」的相对水平,不作绝对断言。
 
 ---
@@ -178,8 +176,8 @@ api/eval/benchmarks/
 | | 纯 BM25 对比 | 0.881(+10pt) |
 | | MRR@10 | **1.0** |
 | **HotpotQA distractor**(多跳推理 / 200 题) | baseline | **EM = 62% / F1 = 74.49% / Recall@4 = 95.75%** |
-| **Verifier A/B**(HotpotQA / 20 题/组) | same(self-critique) | judge 通过率 **0%** / EM 一致 40% |
-| | **cross(deepseek + glm)** | judge 通过率 **95%** / EM 一致 **65%** |
+| **Verifier 历史探索性快照**(HotpotQA / 20 题/组) | same(当时同模型配置) | judge 通过率 **0%** / EM 一致 40% |
+| | cross(当时独立配置) | judge 通过率 **95%** / EM 一致 **65%** |
 
 ---
 
@@ -190,7 +188,7 @@ api/eval/benchmarks/
 3. **rerank 反直觉发现**:在小语料(C-MTEB 300 篇)下 rerank 反而轻微伤害(0.9818 → 0.9777),生产大语料才反转——这给「rerank 何时开启」的工程决策提供数据依据。
 4. **污染了怎么办**:坦诚承认 + 主动声明,仅作系统配置间的相对对比。**主动声明诚实性反而加分**。
 5. **为什么不接 LongMemEval**:英文集和我项目中文优先定位不匹配,实测 2 题 oracle 准确率全 0,工程上明确砍掉而不是硬上数据难看。**能砍掉的判断比加上去更难**。
-6. **Verifier A/B 实证**:不是直觉拍脑袋选 cross verifier,而是 same vs cross 三组对照真出数据(0% vs 95%),数据驱动「不能让模型自评」的工程取舍。
+6. **Verifier 探索记录**:保留当时 none / same / cross 小样本结果与配置，明确不外推为哪种 verifier 更好的结论。
 
 ---
 
@@ -200,7 +198,7 @@ api/eval/benchmarks/
 >
 > - 中文检索 C-MTEB T2Retrieval:混合检索 **nDCG@10 = 0.9818**(vs 纯向量 0.9699 + 1.2pt,vs BM25 0.881 + 10pt);MRR@10 = 1.0
 > - HotpotQA distractor 多跳问答 200 题:**EM = 62% / F1 = 74.49% / 检索 Recall@4 = 95.75%**
-> - **Verifier A/B 实证**:跨家族审稿(deepseek 应答 + glm 审稿)judge 通过率 **95%**,同模型自评仅 **0%**,数据驱动证明「不能让模型自评」
+> - **Verifier 探索记录**:保留 20 题历史配置结果，但不据此宣称 same / cross 的普遍优劣
 > - 工程判断:LongMemEval(英文集)与项目中文优先定位不匹配,实测 oracle 全 0,**明确不做**(能砍掉的判断比加上去更难)
 
 ---

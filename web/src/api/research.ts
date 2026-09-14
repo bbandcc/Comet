@@ -55,6 +55,8 @@ export interface ResearchStep {
 }
 
 // V0.0.5 ② Verifier Loop:SSE 事件 payload + LoopRun 详情类型
+export type QualityStatus = 'passed' | 'failed_quality' | 'judge_error' | 'unavailable' | 'skipped'
+
 export interface LoopVerifyScore {
   raw: Record<string, number>   // {coverage: 4, faithfulness: 4.5, ...} 原始 0~5 分
   total: number                  // 加权归一总分 0~1
@@ -66,7 +68,8 @@ export interface LoopVerifyDoneEvent {
   iteration: number
   scores: LoopVerifyScore | Record<string, never>
   feedback_summary?: string
-  decision: 'pass' | 'retry_patch' | 'retry_rewrite' | 'exceed'
+  decision: 'pass' | 'retry_patch' | 'retry_rewrite' | 'exceed' | 'judge_error' | 'execution_error'
+  quality_status: QualityStatus
   note?: string
 }
 export interface LoopRepairStartEvent {
@@ -78,6 +81,7 @@ export interface LoopRepairStartEvent {
 }
 export interface LoopFinishedEvent {
   status: 'passed' | 'exceeded' | 'failed'
+  quality_status: QualityStatus | null
   final_score: number | null
   iterations: number
   note?: string | null
@@ -113,6 +117,7 @@ export interface LoopDetail {
   run_id: string
   task_type: string
   status: 'running' | 'passed' | 'failed' | 'exceeded'
+  quality_status: QualityStatus | null
   iterations: number
   final_score: number | null
   pass_threshold: number
@@ -139,7 +144,7 @@ export interface ResearchStreamHandlers {
   onReport?: (d: { title: string; markdown: string; sources: ResearchSource[] }) => void
   onDone?: (d: { report_id: string }) => void
   onError?: (message: string) => void
-  // V0.0.5 ② Verifier Loop:6 个新事件
+  // V0.0.5 ② Verifier Loop 事件
   onLoopStarted?: (d: LoopStartedEvent) => void
   onLoopVerifyStart?: (d: LoopVerifyStartEvent) => void
   onLoopVerifyDone?: (d: LoopVerifyDoneEvent) => void
@@ -176,7 +181,7 @@ export const researchApi = {
       { kb_id: kbId ?? null },
     )
   },
-  // V0.0.5 ② Verifier Loop 详情:无 LoopRun(loop_enabled 关 / engine 异常时) → 返回 null
+  // 历史数据无 LoopRun 时返回 null；关闭审稿返回 quality_status=skipped
   loopDetail(id: string) {
     return client.get<unknown, Wrapped<LoopDetail | null>>(`/research/${id}/loop`)
   },

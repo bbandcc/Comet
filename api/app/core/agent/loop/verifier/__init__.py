@@ -5,15 +5,27 @@
 
 两套实现:
 - SameModelVerifier (kind="same") : 同 chat 模型新开 session + critic 角色 prompt (基线)
-- CrossModelVerifier (kind="cross"): 用单独配置的 verifier 模型,跨 family 避免同模型盲点
+- CrossModelVerifier (kind="cross"): 用单独配置的 verifier 模型
 
-A/B 实验在 HotpotQA 上跑出真实数据证明哪种更好(简历卖点)。
+`cross` 只表示使用独立 verifier 配置,不推断模型 family。
 """
-from app.core.agent.loop.verifier.base import Verifier
+
+from app.core.agent.loop.verifier.base import (
+    JudgeError,
+    Verifier,
+    VerifierUnavailableError,
+)
 from app.core.agent.loop.verifier.llm_verifier import (
     CrossModelVerifier,
     SameModelVerifier,
     build_verifier,
 )
 
-__all__ = ["Verifier", "SameModelVerifier", "CrossModelVerifier", "build_verifier"]
+__all__ = [
+    "Verifier",
+    "JudgeError",
+    "VerifierUnavailableError",
+    "SameModelVerifier",
+    "CrossModelVerifier",
+    "build_verifier",
+]

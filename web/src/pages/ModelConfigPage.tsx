@@ -400,7 +400,7 @@ export default function ModelConfigPage() {
                     { name: 'Rerank 重排', tag: '可选', desc: '对知识库检索结果重新排序，提升相关度。不配也能用，配了检索更准。', provider: '通义 gte-rerank' },
                     { name: '联网搜索 Websearch', tag: '可选', desc: '让 AI 能查实时信息（新闻/股价/天气）。配了并在对话开启联网开关才生效。', provider: '百度千帆 / Tavily' },
                     { name: '语音识别 ASR', tag: '可选', desc: '把语音转文字，对话输入框的麦克风用它（更准）。不配则用浏览器免费识别。', provider: '通义千问 paraformer-v2 / OpenAI whisper-1' },
-                    { name: '审稿 Verifier', tag: '可选', desc: '深度研究 Verifier Loop 的独立审稿模型。建议与对话模型用不同供应商（跨家族），避免自评偏乐观。配好并设为默认后会自动用于跨模型审稿；不配则回退为同模型自评。', provider: '智谱 glm-4-flash / 通义 qwen-plus（与对话模型错开家族）' },
+                    { name: '审稿 Verifier', tag: '可选', desc: '深度研究 Verifier Loop 的独立审稿配置。配好并设为默认后可用于 cross 审稿；未配置时会明确记录为审稿不可用。', provider: '智谱 glm-4-flash / 通义 qwen-plus' },
                   ].map((m) => (
                     <div key={m.name} className="model-type-item">
                       <div className="model-type-item__head">

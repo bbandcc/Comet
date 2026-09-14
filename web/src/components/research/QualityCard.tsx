@@ -2,7 +2,7 @@
  * 研究报告质量评分卡 —— V0.0.5 ② Verifier Loop 落地的前端入口。
  *
  * 显示:
- * - verified 徽章(✅ passed / ⚠️ exceeded / ❌ failed)
+ * - 独立质量状态徽章(passed / failed_quality / judge_error / unavailable / skipped)
  * - 加权总分 + 通过阈值 + 迭代次数
  * - 6 维评分雷达图(对比维度硬门槛)
  * - 各轮 feedback 可折叠展开(summary / issues / missing_coverage / wrong_citations / weak_chapters)
@@ -30,35 +30,63 @@ interface QualityCardProps {
   detail: LoopDetail
 }
 
-function StatusBadge({ status }: { status: LoopDetail['status'] }) {
-  if (status === 'passed') {
+function StatusBadge({ detail }: { detail: LoopDetail }) {
+  if (detail.status === 'running' && detail.quality_status == null) {
+    return <Tag color="processing">复核中</Tag>
+  }
+  if (detail.quality_status === 'passed') {
     return (
       <Tag icon={<CheckCircleFilled />} color="success">
-        verified · 通过
+        通过
       </Tag>
     )
   }
-  if (status === 'exceeded') {
+  if (detail.quality_status === 'failed_quality') {
     return (
       <Tag icon={<ExclamationCircleFilled />} color="warning">
-        unverified · 复核未达标
+        质量未通过
       </Tag>
     )
   }
-  if (status === 'failed') {
+  if (detail.quality_status === 'judge_error') {
     return (
       <Tag icon={<CloseCircleFilled />} color="error">
-        失败
+        审稿异常
       </Tag>
     )
   }
-  return <Tag color="processing">复核中</Tag>
+  if (detail.quality_status === 'unavailable') {
+    return <Tag color="error">审稿不可用</Tag>
+  }
+  if (detail.quality_status === 'skipped') {
+    return <Tag>已跳过</Tag>
+  }
+  return <Tag color="default">质量状态未知</Tag>
 }
 
-function RadarChart({ iterations }: { iterations: LoopIterationDetail[] }) {
-  // 取最后一轮的评分作为「最终」(更接近通过状态)
-  const last = iterations[iterations.length - 1]
-  const raw = (last?.scores as { raw?: Record<string, number> })?.raw ?? {}
+function findLastValidScoreIteration(iterations: LoopIterationDetail[]) {
+  return [...iterations].reverse().find((iteration) => {
+    const scores = iteration.scores as { raw?: Record<string, number>; total?: number }
+    const raw = scores.raw
+    return (
+      typeof scores.total === 'number' &&
+      Number.isFinite(scores.total) &&
+      scores.total >= 0 &&
+      scores.total <= 1 &&
+      raw != null &&
+      DIM_LABELS.every(
+        ({ key }) =>
+          typeof raw[key] === 'number' &&
+          Number.isFinite(raw[key]) &&
+          raw[key] >= 0 &&
+          raw[key] <= 5,
+      )
+    )
+  })
+}
+
+function RadarChart({ iteration }: { iteration: LoopIterationDetail }) {
+  const raw = (iteration.scores as { raw: Record<string, number> }).raw
   const series = DIM_LABELS.map((d) => Number(raw[d.key] ?? 0))
   const thresholds = DIM_LABELS.map((d) => d.threshold)
 
@@ -159,13 +187,15 @@ function IterationDetail({ it }: { it: LoopIterationDetail }) {
 export default function QualityCard({ detail }: QualityCardProps) {
   const finalTotal = detail.final_score
   const passRate = detail.pass_threshold
+  const hasValidScore = ['passed', 'failed_quality'].includes(detail.quality_status || '')
+  const finalScoredIteration = findLastValidScoreIteration(detail.iterations_detail)
   return (
     <Card
       title={
         <Space wrap size={8}>
           <span style={{ fontWeight: 600 }}>📊 质量复核</span>
-          <StatusBadge status={detail.status} />
-          {typeof finalTotal === 'number' && (
+          <StatusBadge detail={detail} />
+          {hasValidScore && typeof finalTotal === 'number' && (
             <Tag color={finalTotal >= passRate ? 'success' : 'warning'}>
               加权总分 {finalTotal.toFixed(2)} / 通过阈值 {passRate.toFixed(2)}
             </Tag>
@@ -183,7 +213,7 @@ export default function QualityCard({ detail }: QualityCardProps) {
           <Tooltip title="生成报告的对话模型">
             <Tag color="default">Generator: {detail.generator_model || '-'}</Tag>
           </Tooltip>
-          <Tooltip title="独立 Verifier 模型(同 = self-critique 基线 / 跨 = 异源审稿)">
+          <Tooltip title="Verifier 配置(同 = generator 模型新会话 / 跨 = 独立 verifier 配置)">
             <Tag color="purple">
               Verifier({detail.verifier_kind || '-'}): {detail.verifier_model || '-'}
             </Tag>
@@ -191,11 +221,11 @@ export default function QualityCard({ detail }: QualityCardProps) {
           {detail.note && <Tag color="orange">note: {detail.note}</Tag>}
         </Space>
 
-        {/* 雷达图(用最后一轮评分作为最终) */}
-        {detail.iterations_detail.length > 0 ? (
-          <RadarChart iterations={detail.iterations_detail} />
+        {/* 后续异常轮可能没有评分，因此使用最后一条合法评分。 */}
+        {hasValidScore && finalScoredIteration ? (
+          <RadarChart iteration={finalScoredIteration} />
         ) : (
-          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无评分数据" />
+          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="无有效质量评分" />
         )}
 
         {/* 各轮 feedback 折叠 */}

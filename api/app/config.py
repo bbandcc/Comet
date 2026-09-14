@@ -1,13 +1,12 @@
 """应用配置：全部从环境变量 / .env 读取，不硬编码。"""
+
 from functools import lru_cache
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(
-        env_file=".env", env_file_encoding="utf-8", extra="ignore"
-    )
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     # 应用
     app_name: str = "Comet"
@@ -153,12 +152,12 @@ class Settings(BaseSettings):
     notify_site_url: str = "https://cometxrzs.top"
 
     # ── V0.0.5 ② Verifier Loop（Loop Engineering 落地）──
-    # 是否启用 Verifier Loop。关闭时 research engine 跳过质量复核环节,行为与之前完全一致。
+    # 是否启用 Verifier Loop。关闭时不调用 Judge,记录 skipped,报告仍继续交付。
     loop_enabled: bool = True
     # Verifier 选型:
     #   same  — 同 chat 模型新开 session + critic prompt(基线,无需额外配置)
-    #   cross — 优先用用户配置的 type=verifier 模型(跨 family);未配则自动降级到 same
-    # 默认 cross:有 Verifier 配置即生效,无配置时行为与 same 相同(build_verifier 内降级)
+    #   cross — 使用用户独立配置的 type=verifier 模型；缺失/查询或构建失败显式 unavailable
+    # 默认 cross:只有明确可用的 Verifier 配置才执行评分，不再静默降级到 same
     loop_verifier_kind: str = "cross"
     # 最大迭代轮数(N 轮不通过即 ForceExceed 标 unverified 仍展示)
     loop_max_iterations: int = 2

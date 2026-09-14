@@ -247,12 +247,16 @@ export default function ResearchPage() {
     onLoopVerifyDone: (d) => {
       const total =
         (d.scores as { total?: number })?.total ?? null
+      const resultText =
+        d.quality_status === 'judge_error'
+          ? '审稿异常，未生成质量分'
+          : `评分 ${total != null ? total.toFixed(2) : '-'}(决策:${d.decision})`
       setSteps((s) => [
         ...s,
         {
           icon: 'verify',
-          ok: d.decision === 'pass',
-          text: `第 ${d.iteration} 轮评分 ${total != null ? total.toFixed(2) : '-'}(决策:${d.decision})${d.feedback_summary ? ` · ${d.feedback_summary}` : ''}`,
+          ok: d.quality_status === 'passed',
+          text: `第 ${d.iteration} 轮${resultText}${d.feedback_summary ? ` · ${d.feedback_summary}` : ''}`,
         },
       ])
     },
@@ -269,12 +273,20 @@ export default function ResearchPage() {
       ])
     },
     onLoopFinished: (d) => {
+      const labels = {
+        passed: '通过',
+        failed_quality: '质量未通过',
+        judge_error: '审稿异常',
+        unavailable: '审稿不可用',
+        skipped: '已跳过',
+      }
+      const qualityLabel = d.quality_status ? labels[d.quality_status] : '未形成质量结论'
       setSteps((s) => [
         ...s,
         {
           icon: 'verify',
-          ok: d.status === 'passed',
-          text: `质量复核完成:${d.status === 'passed' ? '通过' : d.status === 'exceeded' ? '未达标(达迭代上限)' : '异常'}${d.final_score != null ? ` · 总分 ${d.final_score.toFixed(2)}` : ''}`,
+          ok: d.quality_status === 'passed',
+          text: `质量复核完成:${qualityLabel}${d.final_score != null ? ` · 总分 ${d.final_score.toFixed(2)}` : ''}`,
         },
       ])
     },
@@ -827,7 +839,7 @@ export default function ResearchPage() {
               </Card>
             )}
 
-            {/* V0.0.5 ② 质量评分卡(loop_enabled 关或异常时 loopDetail=null 不显示) */}
+            {/* 质量评分卡：正常评分与 skipped/error/unavailable 均显式展示 */}
             {loopDetail && !running && (
               <div style={{ marginTop: 16 }}>
                 <QualityCard detail={loopDetail} />

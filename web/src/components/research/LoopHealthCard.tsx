@@ -3,7 +3,7 @@
  *
  * 展示近 30 天:
  * - 总运行数 / 一次通过率 / 平均迭代 / 平均评分
- * - 状态分布(passed / exceeded / failed)
+ * - 独立质量状态分布
  * - 失败维度归因 top
  * - verifier 实际跑的 kind 分布(same vs cross)
  *
@@ -22,7 +22,7 @@ interface Props {
 
 const KIND_LABEL: Record<string, string> = {
   same: '同模型 critic',
-  cross: '跨家族 verifier',
+  cross: '独立 verifier',
   '(none)': '未启用',
 }
 
@@ -36,13 +36,14 @@ export default function LoopHealthCard({ data }: Props) {
       >
         <Empty
           image={Empty.PRESENTED_IMAGE_SIMPLE}
-          description="还没有 Verifier Loop 运行记录,跑一次深度研究后就能看到了"
+          description="暂无已分类的质量记录"
         />
       </Card>
     )
   }
 
-  const passRate = data.total > 0 ? (data.passed / data.total) * 100 : 0
+  const passRate = data.pass_rate * 100
+  const hasJudgedRuns = data.judged_total > 0
 
   const topFail = data.failure_dims[0]
 
@@ -68,16 +69,20 @@ export default function LoopHealthCard({ data }: Props) {
           marginBottom: 14,
         }}
       >
-        <KpiBox label="总运行" value={data.total} />
+        <KpiBox label="五态记录" value={data.total} />
         <KpiBox
           label="一次通过率"
-          value={`${Math.round(data.one_shot_pass_rate * 100)}%`}
-          tone={data.one_shot_pass_rate >= 0.6 ? 'good' : 'warn'}
+          value={hasJudgedRuns ? `${Math.round(data.one_shot_pass_rate * 100)}%` : '-'}
+          tone={hasJudgedRuns ? (data.one_shot_pass_rate >= 0.6 ? 'good' : 'warn') : undefined}
         />
-        <KpiBox label="平均迭代" value={data.avg_iterations.toFixed(1)} />
+        <KpiBox label="平均迭代" value={hasJudgedRuns ? data.avg_iterations.toFixed(1) : '-'} />
         <KpiBox
           label="平均评分"
-          value={data.avg_final_score ? data.avg_final_score.toFixed(2) : '-'}
+          value={
+            hasJudgedRuns && typeof data.avg_final_score === 'number'
+              ? data.avg_final_score.toFixed(2)
+              : '-'
+          }
         />
       </div>
 
@@ -88,16 +93,21 @@ export default function LoopHealthCard({ data }: Props) {
             状态分布
           </Text>
           <Text type="secondary" style={{ fontSize: 12 }}>
-            通过 {data.passed} / 未达标 {data.exceeded} / 失败 {data.failed}
+            通过 {data.passed} / 质量未通过 {data.failed_quality} / 审稿异常 {data.judge_error}
+            {' / '}不可用 {data.unavailable} / 已跳过 {data.skipped}
           </Text>
         </Space>
-        <Progress
-          percent={Math.round(passRate)}
-          success={{ percent: Math.round((data.passed / data.total) * 100) }}
-          size="small"
-          format={(p) => `${p}% 通过`}
-          strokeColor="#369F21"
-        />
+        {hasJudgedRuns ? (
+          <Progress
+            percent={Math.round(passRate)}
+            success={{ percent: Math.round(passRate) }}
+            size="small"
+            format={(p) => `${p}% 通过`}
+            strokeColor="#369F21"
+          />
+        ) : (
+          <Text type="secondary">无有效质量判定</Text>
+        )}
       </div>
 
       {/* 失败维度归因 */}

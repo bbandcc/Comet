@@ -14,6 +14,7 @@
   {"type": "report", "title": str, "markdown": str, "sources": [...]}
   {"type": "error", "message": str}
 """
+
 import asyncio
 import re
 import uuid
@@ -89,10 +90,7 @@ def _linkify_citations(text: str, sources: list[Source]) -> str:
 
 def _source_brief(sources: list[Source]) -> list[dict]:
     """给前端的来源简要（不含正文，避免事件过大）。"""
-    return [
-        {"index": s.index, "type": s.type, "title": s.title, "url": s.url}
-        for s in sources
-    ]
+    return [{"index": s.index, "type": s.type, "title": s.title, "url": s.url} for s in sources]
 
 
 def _build_markdown(
@@ -163,7 +161,7 @@ async def run_research(
     """执行一次深度研究（v2：规划→检索→逐源提炼→反思补搜→大纲整理→分节写作→汇总）。
 
     V0.0.5 ② 起末尾接入 Verifier Loop：独立 LLM-as-judge 复核 + 不合格自动 Patch / 章节重写。
-    可通过 `settings.loop_enabled = False` 关闭(行为退回到 v2 原流程)。
+    `settings.loop_enabled = False` 时不调用 Judge，记录 skipped，报告仍继续交付。
 
     内部各步降级处理，尽量产出报告；引擎为纯异步生成器，与传输层解耦。
 
@@ -225,17 +223,36 @@ async def run_research(
                 if ws:
                     provider, api_key = ws
                     try:
-                        async with tracer.span("检索:联网", span_type="tool_call", attributes={"comet.tool.name": "web_search", "comet.tool.provider": provider}):
-                            collected += await gather_web_sources(provider, api_key, queries, emit=emit)
+                        async with tracer.span(
+                            "检索:联网",
+                            span_type="tool_call",
+                            attributes={
+                                "comet.tool.name": "web_search",
+                                "comet.tool.provider": provider,
+                            },
+                        ):
+                            collected += await gather_web_sources(
+                                provider, api_key, queries, emit=emit
+                            )
                     except Exception as e:
                         logger.warning("研究联网检索整体失败（继续）: %s", e)
                 try:
-                    async with tracer.span("检索:知识库", span_type="tool_call", attributes={"comet.tool.name": "kb_search"}):
-                        collected += await gather_kb_sources(session, user_id, queries, kb_ids, emit=emit)
+                    async with tracer.span(
+                        "检索:知识库",
+                        span_type="tool_call",
+                        attributes={"comet.tool.name": "kb_search"},
+                    ):
+                        collected += await gather_kb_sources(
+                            session, user_id, queries, kb_ids, emit=emit
+                        )
                 except Exception as e:
                     logger.warning("研究知识库检索整体失败（继续）: %s", e)
                 try:
-                    async with tracer.span("检索:MCP 增强", span_type="mcp_call", attributes={"comet.tool.name": "mcp_research"}):
+                    async with tracer.span(
+                        "检索:MCP 增强",
+                        span_type="mcp_call",
+                        attributes={"comet.tool.name": "mcp_research"},
+                    ):
                         collected += await gather_mcp_sources(
                             session, user_id, topic, model, supports_fc, emit=emit
                         )
@@ -341,9 +358,7 @@ async def run_research(
             }
             yield {"type": "section_start", "heading": sec.heading}
             buf: list[str] = []
-            async with tracer.span(
-                f"写章节 {i}/{total}: {sec.heading}", span_type="writer"
-            ) as wsp:
+            async with tracer.span(f"写章节 {i}/{total}: {sec.heading}", span_type="writer") as wsp:
                 wsp.set_attribute("section_index", i)
                 wsp.set_attribute("section_total", total)
                 wsp.set_attribute("learning_count", len(sec_learnings))
@@ -369,19 +384,6 @@ async def run_research(
 
         # ── 9. Verifier Loop(V0.0.5 ②):独立 LLM-as-judge 复核 + 不合格 Patch/Rewrite 回炉 ──
         final_markdown = markdown
-        final_sources = list(sources)
-        if not settings.loop_enabled:
-            # 开关关闭:跳过质量复核,行为与 v2 原流程一致
-            yield {
-                "type": "report",
-                "title": plan.title,
-                "markdown": final_markdown,
-                "sources": [
-                    {"index": s.index, "type": s.type, "title": s.title, "url": s.url}
-                    for s in final_sources
-                ],
-            }
-            return
 
         # ── 闭包内可变状态(给 callback 用,可跨多轮累加 sources/learnings 与重写章节)──
         loop_sources: list[Source] = list(sources)
@@ -418,14 +420,10 @@ async def run_research(
                 loop_learnings.extend(new_learnings)
                 # 简化合并:把新要点整理为一个「补充信息」章节追加(避免重写正文章节,成本低)
                 supp_heading = "补充信息(质量复核反馈后追加)"
-                supp_lines = [
-                    f"- {le.text} [来源 {le.source_index}]" for le in new_learnings
-                ]
+                supp_lines = [f"- {le.text} [来源 {le.source_index}]" for le in new_learnings]
                 supp_content = "\n".join(supp_lines) if supp_lines else "(无补充)"
                 # 替换或追加
-                idx = next(
-                    (i for i, (h, _) in enumerate(loop_written) if h == supp_heading), None
-                )
+                idx = next((i for i, (h, _) in enumerate(loop_written) if h == supp_heading), None)
                 if idx is None:
                     loop_written.append((supp_heading, supp_content))
                 else:
@@ -457,9 +455,7 @@ async def run_research(
                     ):
                         buf.append(tok)
                     new_content = "".join(buf).strip() or "(本章节暂无内容)"
-                    idx = next(
-                        (i for i, (h, _) in enumerate(loop_written) if h == ch), None
-                    )
+                    idx = next((i for i, (h, _) in enumerate(loop_written) if h == ch), None)
                     if idx is not None:
                         loop_written[idx] = (ch, new_content)
                 return _rebuild_artifact()
@@ -482,6 +478,7 @@ async def run_research(
                 verifier_kind=settings.loop_verifier_kind,
                 generator_model=model,
                 generator_model_name=getattr(config, "model_name", "") or "",
+                enabled=settings.loop_enabled,
                 repair_ctx=RepairCallbackArgs(
                     patch_callback=patch_callback,
                     rewrite_callback=rewrite_callback,

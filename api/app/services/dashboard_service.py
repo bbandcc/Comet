@@ -1,4 +1,5 @@
 """仪表盘统计业务服务：聚合 PG / Neo4j 计数与分布，供首页与记忆统计展示。"""
+
 import uuid
 from datetime import datetime, timedelta
 
@@ -155,53 +156,77 @@ class DashboardService:
         """V0.0.5 ② Loop 健康度:近 N 天 Verifier Loop 运行情况聚合。
 
         返回:
-        - total / passed / exceeded / failed:状态分布
-        - one_shot_pass_rate:一次通过率(iterations=1 且 status=passed)
-        - avg_iterations:平均迭代次数(passed + exceeded)
-        - avg_final_score:平均最终评分(passed + exceeded)
+        - 五种独立 quality_status 分布；历史 NULL 不进入 total
+        - pass_rate / one_shot_pass_rate:分母仅为 passed + failed_quality
+        - avg_iterations / avg_final_score:仅统计有合法质量分的 run
         - failure_dims:失败维度归因(各维度单维不达硬门槛的次数 top 5)
         - verifier_kinds:verifier_kind 分布(same / cross 各跑了多少次)
         """
         from datetime import datetime as _dt, timedelta
 
-        from app.models.loop_model import (
-            STATUS_EXCEEDED,
-            STATUS_FAILED,
-            STATUS_PASSED,
-            LoopIteration,
-            LoopRun,
+        from app.core.agent.loop.models import (
+            QUALITY_FAILED,
+            QUALITY_JUDGE_ERROR,
+            QUALITY_PASSED,
+            QUALITY_SKIPPED,
+            QUALITY_UNAVAILABLE,
         )
+        from app.models.loop_model import LoopIteration, LoopRun
 
         # loop_runs.started_at 是 TIMESTAMP WITHOUT TIME ZONE（naive），
         # 用 naive now() 保持一致，避免 aware/naive 混用触发 asyncpg DataError
         since = _dt.now() - timedelta(days=days)
 
-        # 1) 状态分布 + 迭代/评分平均(passed/exceeded 计入)
+        # 1) 质量状态分布 + 仅合法评分的迭代/评分平均
         rows = await self.session.execute(
-            select(LoopRun.status, LoopRun.iterations, LoopRun.final_score,
-                   LoopRun.verifier_kind)
+            select(
+                LoopRun.quality_status,
+                LoopRun.iterations,
+                LoopRun.final_score,
+                LoopRun.verifier_kind,
+            )
             .where(LoopRun.user_id == user_id)
             .where(LoopRun.started_at >= since)
         )
         runs = rows.all()
-        total = len(runs)
-        passed = sum(1 for r in runs if r.status == STATUS_PASSED)
-        exceeded = sum(1 for r in runs if r.status == STATUS_EXCEEDED)
-        failed = sum(1 for r in runs if r.status == STATUS_FAILED)
-        # 一次通过率:第一轮就通过的占比(passed 且 iterations=1)
-        one_shot = sum(1 for r in runs if r.status == STATUS_PASSED and r.iterations == 1)
-        one_shot_rate = round(one_shot / total, 4) if total else 0.0
-        # 平均迭代(只看 passed/exceeded,failed 是异常崩溃没意义)
-        valid_for_avg = [r for r in runs if r.status in (STATUS_PASSED, STATUS_EXCEEDED)]
+        explicit_statuses = {
+            QUALITY_PASSED,
+            QUALITY_FAILED,
+            QUALITY_JUDGE_ERROR,
+            QUALITY_UNAVAILABLE,
+            QUALITY_SKIPPED,
+        }
+        explicit_runs = [r for r in runs if r.quality_status in explicit_statuses]
+        total = len(explicit_runs)
+        passed = sum(1 for r in explicit_runs if r.quality_status == QUALITY_PASSED)
+        failed_quality = sum(1 for r in explicit_runs if r.quality_status == QUALITY_FAILED)
+        judge_error = sum(1 for r in explicit_runs if r.quality_status == QUALITY_JUDGE_ERROR)
+        unavailable = sum(1 for r in explicit_runs if r.quality_status == QUALITY_UNAVAILABLE)
+        skipped = sum(1 for r in explicit_runs if r.quality_status == QUALITY_SKIPPED)
+        valid_for_avg = [
+            r for r in explicit_runs if r.quality_status in (QUALITY_PASSED, QUALITY_FAILED)
+        ]
+        judged_total = len(valid_for_avg)
+        pass_rate = round(passed / judged_total, 4) if judged_total else 0.0
+        one_shot = sum(
+            1 for r in valid_for_avg if r.quality_status == QUALITY_PASSED and r.iterations == 1
+        )
+        one_shot_rate = round(one_shot / judged_total, 4) if judged_total else 0.0
         avg_iter = (
             round(sum(r.iterations for r in valid_for_avg) / len(valid_for_avg), 2)
-            if valid_for_avg else 0.0
+            if valid_for_avg
+            else 0.0
         )
         scores = [r.final_score for r in valid_for_avg if r.final_score is not None]
         avg_score = round(sum(scores) / len(scores), 4) if scores else 0.0
         # verifier_kind 分布
         kind_dist: dict[str, int] = {}
-        for r in runs:
+        actual_verifier_runs = [
+            r
+            for r in explicit_runs
+            if r.quality_status in (QUALITY_PASSED, QUALITY_FAILED, QUALITY_JUDGE_ERROR)
+        ]
+        for r in actual_verifier_runs:
             k = r.verifier_kind or "(none)"
             kind_dist[k] = kind_dist.get(k, 0) + 1
 
@@ -225,30 +250,40 @@ class DashboardService:
         }
         # 只拉本用户近 N 天的 iterations(走 JOIN 避免拉全表)
         it_rows = await self.session.execute(
-            select(LoopIteration.scores)
+            select(LoopIteration.scores, LoopRun.quality_status)
             .join(LoopRun, LoopIteration.run_id == LoopRun.id)
             .where(LoopRun.user_id == user_id)
             .where(LoopRun.started_at >= since)
+            .where(LoopRun.quality_status.in_((QUALITY_PASSED, QUALITY_FAILED)))
         )
         dim_fail_count: dict[str, int] = {}
-        for (scores_jsonb,) in it_rows.all():
+        for scores_jsonb, quality_status in it_rows.all():
+            if quality_status not in (QUALITY_PASSED, QUALITY_FAILED):
+                continue
             raw = (scores_jsonb or {}).get("raw") or {}
             for dim, thr in thresholds.items():
                 v = raw.get(dim)
                 if isinstance(v, (int, float)) and float(v) < thr:
                     dim_fail_count[dim] = dim_fail_count.get(dim, 0) + 1
         failure_dims = sorted(
-            [{"dim": d, "label": labels.get(d, d), "count": c}
-             for d, c in dim_fail_count.items()],
-            key=lambda x: x["count"], reverse=True,
+            [{"dim": d, "label": labels.get(d, d), "count": c} for d, c in dim_fail_count.items()],
+            key=lambda x: x["count"],
+            reverse=True,
         )[:6]
 
         return {
             "days": days,
             "total": total,
+            "judged_total": judged_total,
             "passed": passed,
-            "exceeded": exceeded,
-            "failed": failed,
+            "failed_quality": failed_quality,
+            "judge_error": judge_error,
+            "unavailable": unavailable,
+            "skipped": skipped,
+            # 兼容旧客户端；新 UI 使用上面的独立质量状态。
+            "exceeded": failed_quality,
+            "failed": judge_error + unavailable,
+            "pass_rate": pass_rate,
             "one_shot_pass_rate": one_shot_rate,
             "avg_iterations": avg_iter,
             "avg_final_score": avg_score,

@@ -3,6 +3,7 @@
 与单聊一致：生成动作跑在独立 session 的后台任务里，事件经 Redis bus 广播；
 本 SSE 连接只订阅转发。客户端断开不影响研究跑完、落库；生成中重连可续传。
 """
+
 import asyncio
 import json
 import uuid
@@ -80,9 +81,7 @@ class ResearchService:
         pubsub = await bus.open_channel(rid)
         try:
             if await bus.acquire_turn_lock(rid):
-                task = asyncio.create_task(
-                    self._run_research_bg(user_id, uuid.UUID(rid), body)
-                )
+                task = asyncio.create_task(self._run_research_bg(user_id, uuid.UUID(rid), body))
                 _BG_TASKS.add(task)
                 task.add_done_callback(_BG_TASKS.discard)
             async for sse in self._relay(pubsub, rid):
@@ -295,9 +294,7 @@ class ResearchService:
 
     # ── 状态/落库辅助 ──
 
-    async def _set_status(
-        self, session: AsyncSession, report_id: uuid.UUID, status: str
-    ) -> None:
+    async def _set_status(self, session: AsyncSession, report_id: uuid.UUID, status: str) -> None:
         repo = ResearchReportRepository(session)
         report = await repo.get_by_id(report_id)
         if report:
@@ -433,9 +430,7 @@ class ResearchService:
             )
 
             async with SessionLocal() as session:
-                return await KnowledgeBaseRepository(session).list_chat_enabled_ids(
-                    user_id
-                )
+                return await KnowledgeBaseRepository(session).list_chat_enabled_ids(user_id)
         except Exception as e:
             logger.warning("解析研究知识库范围失败（不限库）: %s", e)
             return None
@@ -448,18 +443,14 @@ class ResearchService:
         reports, total = await self.repo.list_paged(user_id, page, page_size)
         return [self.to_brief(r) for r in reports], total
 
-    async def get_detail(
-        self, user_id: uuid.UUID, report_id: uuid.UUID
-    ) -> dict:
+    async def get_detail(self, user_id: uuid.UUID, report_id: uuid.UUID) -> dict:
         report = await self._get_or_404(user_id, report_id)
         return self.to_detail(report)
 
-    async def get_loop_detail(
-        self, user_id: uuid.UUID, report_id: uuid.UUID
-    ) -> dict | None:
+    async def get_loop_detail(self, user_id: uuid.UUID, report_id: uuid.UUID) -> dict | None:
         """V0.0.5 ② Verifier Loop 详情:LoopRun + 各轮 iteration。
 
-        报告生成时未跑 verifier(loop_enabled 关 / engine 异常)→ 返回 None,前端不显示评分卡。
+        历史数据无 LoopRun 时返回 None；关闭审稿会以 quality_status=skipped 显式返回。
         """
         from app.core.agent.loop.store import LoopStore
 
@@ -474,6 +465,7 @@ class ResearchService:
             "run_id": str(run.id),
             "task_type": run.task_type,
             "status": run.status,
+            "quality_status": run.quality_status,
             "iterations": run.iterations,
             "final_score": run.final_score,
             "pass_threshold": run.pass_threshold,
@@ -488,8 +480,8 @@ class ResearchService:
             "iterations_detail": [
                 {
                     "iteration_no": it.iteration_no,
-                    "scores": it.scores,           # {raw: {coverage:..., ...}, total: 0.78}
-                    "feedback": it.feedback,       # {summary, issues, missing_coverage, ...}
+                    "scores": it.scores,  # {raw: {coverage:..., ...}, total: 0.78}
+                    "feedback": it.feedback,  # {summary, issues, missing_coverage, ...}
                     "decision": it.decision,
                     "repair_action": it.repair_action,
                     "duration_ms": it.duration_ms,
@@ -561,9 +553,7 @@ class ResearchService:
         logger.info("研究报告存入知识库: report=%s doc=%s kb=%s", report_id, doc_id, resolved_kb)
         return {"document_id": str(doc_id), "kb_id": str(resolved_kb), "kb_name": kb_name}
 
-    async def _get_or_404(
-        self, user_id: uuid.UUID, report_id: uuid.UUID
-    ) -> ResearchReport:
+    async def _get_or_404(self, user_id: uuid.UUID, report_id: uuid.UUID) -> ResearchReport:
         report = await self.repo.get(user_id, report_id)
         if not report:
             raise BizError("研究报告不存在", code=3051, status_code=404)

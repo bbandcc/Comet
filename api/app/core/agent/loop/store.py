@@ -1,10 +1,11 @@
-"""Verifier Loop 状态外置层 —— 落库 / 恢复 / 查询。
+"""Verifier Loop 状态外置层 —— 审计落库 / 查询。
 
 Controller 不直接操作 ORM,所有 DB 访问走这里。这样:
 - Controller 保持纯,便于单元测试(可 mock store)
 - 落库逻辑集中,异常处理统一
 - 未来切换存储(如 Redis 缓存 + PG 持久化)只改这一处
 """
+
 from __future__ import annotations
 
 import uuid
@@ -13,7 +14,7 @@ from datetime import UTC, datetime
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.agent.loop.models import IterationOutcome
+from app.core.agent.loop.models import IterationOutcome, QualityStatus
 from app.core.logging import get_logger
 from app.models.loop_model import (
     STATUS_EXCEEDED,
@@ -68,9 +69,7 @@ class LoopStore:
         await self.session.refresh(run)
         return run
 
-    async def record_iteration(
-        self, run_id: uuid.UUID, outcome: IterationOutcome
-    ) -> None:
+    async def record_iteration(self, run_id: uuid.UUID, outcome: IterationOutcome) -> None:
         """落库一轮迭代记录,同时更新 LoopRun 的 iterations 计数。"""
         try:
             it = LoopIteration(
@@ -78,11 +77,15 @@ class LoopStore:
                 run_id=run_id,
                 iteration_no=outcome.iteration_no,
                 artifact_snapshot=outcome.artifact_snapshot,
-                scores={
-                    "raw": outcome.score.raw_scores,
-                    "total": outcome.score.total,
-                },
-                feedback=outcome.score.feedback,
+                scores=(
+                    {
+                        "raw": outcome.score.raw_scores,
+                        "total": outcome.score.total,
+                    }
+                    if outcome.score is not None
+                    else {}
+                ),
+                feedback=outcome.score.feedback if outcome.score is not None else {},
                 decision=outcome.decision,
                 repair_action=(
                     outcome.repair_action.model_dump() if outcome.repair_action else None
@@ -104,15 +107,17 @@ class LoopStore:
         run_id: uuid.UUID,
         *,
         status: str,
+        quality_status: QualityStatus | None,
         final_score: float | None,
         note: str | None = None,
     ) -> None:
-        """终结一次 Loop:passed / exceeded / failed。"""
+        """分别终结兼容执行状态与 S3a 质量状态。"""
         try:
             run = await self.session.get(LoopRun, run_id)
             if run is None:
                 return
             run.status = status
+            run.quality_status = quality_status
             run.final_score = final_score
             run.finished_at = datetime.now(UTC)
             if note:
@@ -136,9 +141,7 @@ class LoopStore:
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
 
-    async def find_latest_by_task(
-        self, *, task_type: str, task_id: uuid.UUID
-    ) -> LoopRun | None:
+    async def find_latest_by_task(self, *, task_type: str, task_id: uuid.UUID) -> LoopRun | None:
         """按业务 task_id 找最近一次 Loop(供前端展示「质量评分卡」用)。"""
         stmt = (
             select(LoopRun)

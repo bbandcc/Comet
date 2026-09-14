@@ -43,8 +43,9 @@ export interface AgentTaskRun {
   status: 'pending' | 'planning' | 'searching' | 'writing' | 'summarizing' | 'done' | 'failed'
   error_msg: string | null
   created_at: string | null
-  // V0.0.5 ② Verifier Loop 复核状态:passed/exceeded/failed/none(没跑过 verifier)
-  verified?: 'passed' | 'exceeded' | 'failed' | 'running' | 'none'
+  // verified 保持旧 LoopRun.status 值域；quality_status 是 S3a 起的质量真值。
+  verified?: 'running' | 'passed' | 'failed' | 'exceeded' | 'none'
+  quality_status?: 'passed' | 'failed_quality' | 'judge_error' | 'unavailable' | 'skipped' | 'none'
   final_score?: number | null
 }
 

@@ -8,6 +8,7 @@
 队列：heartbeat → beat（轻量，不可被堵）；run → research（重活，独立队列）。
 与其他 beat 任务一致：任务级独立引擎（NullPool）+ 独立事件循环（asyncio.run）。
 """
+
 import asyncio
 import uuid
 from datetime import datetime
@@ -42,6 +43,7 @@ logger = get_logger(__name__)
 
 # ── 每分钟心跳：原子认领到期任务 → 推进 next_run_at → 派发 ──
 
+
 async def _heartbeat() -> int:
     engine_db = create_task_engine()
     sm = async_sessionmaker(engine_db, expire_on_commit=False, class_=AsyncSession)
@@ -75,6 +77,7 @@ def heartbeat_task() -> int:
 
 
 # ── 执行一次研究任务（Redis 锁 + 硬超时）──
+
 
 async def _run_task(task_id: str) -> None:
     tid = uuid.UUID(task_id)
@@ -191,7 +194,8 @@ async def _do_run(tid: uuid.UUID) -> None:
             else:
                 logger.info(
                     "定时任务 Verifier Loop 未通过,跳过手机推送: report=%s task=%s",
-                    report_id, tid,
+                    report_id,
+                    tid,
                 )
     finally:
         await engine_db.dispose()
@@ -230,9 +234,7 @@ async def _execute_research(
 
     try:
         async with sm() as session:
-            await asyncio.wait_for(
-                _collect(session), timeout=settings.research_task_timeout
-            )
+            await asyncio.wait_for(_collect(session), timeout=settings.research_task_timeout)
             if holder["md"] is None:
                 raise RuntimeError("研究未产出报告")
             # 正常完成：session 健康，直接落 done
@@ -285,6 +287,7 @@ def run_agent_task_task(task_id: str) -> str:
 
 # ── 完成后推送通知 ──
 
+
 def _extract_summary(md: str, limit: int = 360) -> str:
     """从报告 Markdown 提取简报：TL;DR 引用块 + 核心要点前几条，截断。"""
     if not md:
@@ -331,42 +334,38 @@ async def _notify_user(
             summary = _extract_summary(report.report_md)
             link = f"{settings.notify_site_url.rstrip('/')}/research?report={report_id}"
             content = f"{summary}\n\n📄 查看完整报告：{link}"
-            sent = await NotifyService(session).push_to_user(
-                user_id, f"🔬 {title}", content
-            )
+            sent = await NotifyService(session).push_to_user(user_id, f"🔬 {title}", content)
             if sent:
                 logger.info("定时任务推送完成: report=%s 渠道数=%d", report_id, sent)
     except Exception as e:  # noqa: BLE001
         logger.warning("定时任务推送失败（忽略）: report=%s err=%s", report_id, e)
 
 
-async def _check_loop_passed(
-    sm: async_sessionmaker, report_id: uuid.UUID
-) -> bool:
+async def _check_loop_passed(sm: async_sessionmaker, report_id: uuid.UUID) -> bool:
     """检查 research engine 已跑过的 Verifier Loop 通过状态。
 
     V0.0.5 ② 设计:engine 内已经接 LoopController(task_type=research, task_id=report_id),
     定时任务**不重复跑 verify**,只读结果决定要不要推送。
 
     返回 True 当且仅当:
-    - Loop 关闭(settings.loop_enabled=False) → 视为通过(无评分时不阻塞推送)
-    - 找到 LoopRun 且 status=passed
-    其他情况(exceeded / failed / 未找到)→ 视为未通过,跳过推送。
+    - Loop 关闭(settings.loop_enabled=False) → 不调用 Judge、记录 skipped，报告与推送继续交付
+    - 强质量门禁开启时，找到 LoopRun 且 quality_status=passed
+    其他情况均视为未通过；缺 run 与查询错误必须 fail-closed。
     """
     if not settings.loop_enabled:
         return True
     try:
         from app.core.agent.loop.store import LoopStore
-        from app.models.loop_model import STATUS_PASSED
+        from app.core.agent.loop.models import QUALITY_PASSED
 
         async with sm() as session:
             run = await LoopStore(session).find_latest_by_task(
                 task_type="research", task_id=report_id
             )
             if run is None:
-                logger.info("Verifier Loop 未找到对应 run,降级视为通过: report=%s", report_id)
-                return True  # 没跑过(可能是引擎里 verifier 早期异常),不阻塞推送
-            return run.status == STATUS_PASSED
+                logger.warning("Verifier Loop 未找到对应 run,拒绝推送: report=%s", report_id)
+                return False
+            return run.quality_status == QUALITY_PASSED
     except Exception as e:  # noqa: BLE001
-        logger.warning("查 LoopRun 失败,降级视为通过: report=%s err=%s", report_id, e)
-        return True
+        logger.warning("查 LoopRun 失败,拒绝推送: report=%s err=%s", report_id, e)
+        return False

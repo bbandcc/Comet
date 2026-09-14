@@ -52,20 +52,30 @@ uv run ruff check app tests
 
 涉及并发、重试、超时、缓存或状态迁移时，测试必须控制时序并断言后置状态，不能只靠大量随机重复。依赖 Redis、数据库或浏览器的测试应使用隔离命名空间和独立测试数据，不操作开发者现有数据。
 
-## 当前切片：S2c MCP session lifecycle
+## 当前切片：S3a Judge 状态
 
-- 持久 MCP session 的 enter、工具加载和 exit 必须在同一个 owner task/协程内完成，不得把含
-  AnyIO TaskGroup/CancelScope 的上下文从子 task 移交给父 task 清理。
-- 初版按 server 串行建立持久会话；lifecycle-sensitive 路径不使用 `gather`、`create_task` 或
-  `wait_for`，单 server 超时使用当前 task 内的 `asyncio.timeout`。
-- 单 server 初始化失败或超时只跳过该 server；已经打开的会话在正常退出、失败和外部取消时
-  都必须关闭，`CancelledError` 必须继续传播。
-- 保留 MCP 工具命名、去重、降级语义和非持久 `build_mcp_tools` 行为；继续保持 S2a outcome/cache
-  与 S2b capability/terminal/budget 契约。
-- 单聊/群聊 `build_enabled_tools_cm` 与 Research `gather_mcp_sources` 必须共同使用修复后的
-  `open_mcp_tools`，不复制生命周期实现。
-- 本切片不升级 MCP adapter/SDK，不修改 Research evidence/source、Verifier、Memory、RAG、
-  checkpoint、parallel tool calls 或其他 S3+ 范围。
+- 质量状态固定区分 `passed / failed_quality / judge_error / unavailable / skipped`；执行状态与质量
+  状态分开表达，兼容保留现有 `LoopRun.status`，新增的持久质量字段必须有最小迁移。
+- Judge 正常输出必须是严格 JSON object；`raw_scores` 必须覆盖 rubric 全部维度，每项为
+  `0..raw_max` 内的有限 JSON number。非法 JSON、类型/字段错误、缺维度、NaN/Inf 和越界值均为
+  `judge_error`，不得伪造成零分或正常质量结果。
+- `feedback` 必须完整符合 prompt 的结构化字段与嵌套类型；只有 verifier 调用/解析失败属于
+  `judge_error`，policy/controller/repair-plan 等执行异常不得伪造 Judge 结论；未形成合法质量结论
+  时 `quality_status=None`，已有合法结论时保留。
+- cross verifier 配置缺失、查询失败或模型构建失败统一为 `unavailable`，不得静默降级 same；
+  `judge_error / unavailable / skipped` 不得触发 Patch/Rewrite。
+- `loop_enabled=False` 明确记录并展示 `skipped`，但报告继续交付；强质量门禁开启时，定时推送只
+  接受明确 `passed`，缺 run、查询失败及其他状态全部 fail-closed。
+- API、SSE 与前端只做质量状态的最小字段和展示同步，不建立新状态机，不改变报告交付、现有
+  Patch/Rewrite 算法及 S1/S2 契约。
+- Dashboard 五态 total 排除历史未知记录；通过率只以合法 judged runs 为分母，失败维度只读取
+  合法质量评分，未实际运行 Judge 的状态不进入 verifier kind 分布。
+- `iterations` 只统计实际发起的 Judge 调用；Judge 已形成合法 score 后，后续非 Judge 执行错误仍须
+  保留该轮审计记录，必要时使用 `execution_error` decision，但不得伪造新的质量状态。
+- cross 配置查询失败转为 `unavailable` 前应 best-effort rollback；当前落库只提供 audit trail 和
+  后续 S4 基础，不宣称已经支持崩溃后 computation resume。
+- 本切片不处理证据正文、preview/content、stable source/evidence id 或引用支持判断（S3b），
+  不修改断言定位与 Patch/Rewrite 算法（S3c），不进入 checkpoint、Memory 或 RAG。
 
 ## Git 规则
 

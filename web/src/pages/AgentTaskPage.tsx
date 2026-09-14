@@ -403,19 +403,30 @@ export default function AgentTaskPage() {
                     {r.status === 'done' && <Tag color="success">完成</Tag>}
                     {r.status === 'failed' && <Tag color="error">失败</Tag>}
                     {!['done', 'failed'].includes(r.status) && <Tag color="processing">运行中</Tag>}
-                    {/* V0.0.5 ② Verifier Loop 徽章(仅完成且跑过 verifier 才显示) */}
-                    {r.status === 'done' && r.verified === 'passed' && (
+                    {/* S3a 质量真值只读取 quality_status；verified 仅留给旧客户端兼容 */}
+                    {r.status === 'done' && r.quality_status === 'passed' && (
                       <Tag color="success">
                         ✓ verified{typeof r.final_score === 'number' ? ` · ${r.final_score.toFixed(2)}` : ''}
                       </Tag>
                     )}
-                    {r.status === 'done' && r.verified === 'exceeded' && (
+                    {r.status === 'done' && r.quality_status === 'failed_quality' && (
                       <Tag color="warning">
-                        ⚠ 复核未达标{typeof r.final_score === 'number' ? ` · ${r.final_score.toFixed(2)}` : ''}
+                        ⚠ 质量未通过{typeof r.final_score === 'number' ? ` · ${r.final_score.toFixed(2)}` : ''}
                       </Tag>
                     )}
-                    {r.status === 'done' && r.verified === 'failed' && (
-                      <Tag color="error">复核异常</Tag>
+                    {r.status === 'done' && r.quality_status === 'judge_error' && (
+                      <Tag color="error">审稿异常</Tag>
+                    )}
+                    {r.status === 'done' && r.quality_status === 'unavailable' && (
+                      <Tag color="error">审稿不可用</Tag>
+                    )}
+                    {r.status === 'done' && r.quality_status === 'skipped' && (
+                      <Tag>审稿已跳过</Tag>
+                    )}
+                    {r.status === 'done' && r.quality_status === 'none' && (
+                      <Tag color={r.verified === 'failed' ? 'error' : 'default'}>
+                        {r.verified === 'failed' ? '复核执行异常 · 质量未确认' : '质量未确认'}
+                      </Tag>
                     )}
                     {/* 执行轨迹入口:跳 /traces 并自动展开该报告对应的 trace */}
                     {r.status !== 'pending' && (

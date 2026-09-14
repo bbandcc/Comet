@@ -3,33 +3,35 @@
 ORM 落库结构在 app.models.loop_model;这里是各模块间(rubric/verifier/repair/policy/controller)传递用的纯数据类,
 与 ORM 解耦,便于序列化、单元测试。
 """
+
 from __future__ import annotations
 
 import uuid
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
 
 # ─────────── Rubric ───────────
 
+
 class RubricDim(BaseModel):
     """Rubric 一个维度的定义。"""
 
-    key: str                     # 内部 key,如 "coverage" / "faithfulness"
-    label: str                   # 展示名,如 "覆盖度"
-    weight: float                # 在总分里的权重
-    threshold: float = 0.0       # 单维硬门槛,< 此值整体不通过(原始 0~5 分制)
-    desc: str = ""               # 评分参考(给 verifier prompt 用)
+    key: str  # 内部 key,如 "coverage" / "faithfulness"
+    label: str  # 展示名,如 "覆盖度"
+    weight: float  # 在总分里的权重
+    threshold: float = 0.0  # 单维硬门槛,< 此值整体不通过(原始 0~5 分制)
+    desc: str = ""  # 评分参考(给 verifier prompt 用)
 
 
 class RubricDef(BaseModel):
     """一套 rubric 定义(研究 / 定时任务 / 未来扩展)。"""
 
-    name: str                     # "research" / "task"
+    name: str  # "research" / "task"
     dims: list[RubricDim]
-    pass_threshold: float = 0.7   # 加权后总分通过线(归一到 0~1)
-    raw_max: float = 5.0          # 单维原始分上限(verifier 输出按这个量纲)
+    pass_threshold: float = 0.7  # 加权后总分通过线(归一到 0~1)
+    raw_max: float = 5.0  # 单维原始分上限(verifier 输出按这个量纲)
 
     def normalize(self, raw: float) -> float:
         """单维原始分 → 归一到 [0,1]。"""
@@ -61,12 +63,27 @@ class RubricDef(BaseModel):
 
 # ─────────── Verifier ───────────
 
+QUALITY_PASSED = "passed"
+QUALITY_FAILED = "failed_quality"
+QUALITY_JUDGE_ERROR = "judge_error"
+QUALITY_UNAVAILABLE = "unavailable"
+QUALITY_SKIPPED = "skipped"
+
+QualityStatus = Literal[
+    "passed",
+    "failed_quality",
+    "judge_error",
+    "unavailable",
+    "skipped",
+]
+
+
 class VerifyScore(BaseModel):
     """Verifier 单次评分结果。"""
 
-    raw_scores: dict[str, float] = Field(default_factory=dict)   # 维度 key → 0~raw_max 原始分
-    total: float = 0.0                                            # 加权归一总分 0~1
-    feedback: dict[str, Any] = Field(default_factory=dict)        # 结构化反馈,供 repair 消费
+    raw_scores: dict[str, float] = Field(default_factory=dict)  # 维度 key → 0~raw_max 原始分
+    total: float = 0.0  # 加权归一总分 0~1
+    feedback: dict[str, Any] = Field(default_factory=dict)  # 结构化反馈,供 repair 消费
     # feedback 内常见字段(repair 会消费):
     #   - "issues": [{"dim":"coverage","detail":"第二章未提及 X"}, ...]
     #   - "missing_coverage": ["子问题 X 未回答", ...]
@@ -81,18 +98,21 @@ DECISION_PASS = "pass"
 DECISION_RETRY_PATCH = "retry_patch"
 DECISION_RETRY_REWRITE = "retry_rewrite"
 DECISION_EXCEED = "exceed"
+DECISION_JUDGE_ERROR = "judge_error"
+DECISION_EXECUTION_ERROR = "execution_error"
 
 
 class RepairAction(BaseModel):
     """Repair 策略产生的修复动作描述(落库 + 给 generator 消费)。"""
 
-    kind: str                                       # patch / chapter_rewrite / force_exceed
-    patch_queries: list[str] = Field(default_factory=list)        # PatchRepair 补搜的子查询
-    rewrite_chapters: list[str] = Field(default_factory=list)     # ChapterRewrite 要重写的章节标题
-    rationale: str = ""                              # 选这个动作的简要原因(给前端 audit)
+    kind: str  # patch / chapter_rewrite / force_exceed
+    patch_queries: list[str] = Field(default_factory=list)  # PatchRepair 补搜的子查询
+    rewrite_chapters: list[str] = Field(default_factory=list)  # ChapterRewrite 要重写的章节标题
+    rationale: str = ""  # 选这个动作的简要原因(给前端 audit)
 
 
 # ─────────── Iteration outcome ───────────
+
 
 class IterationOutcome(BaseModel):
     """单轮 generate→verify→decide 后的结果汇总(落库 + 上抛给 controller)。"""
@@ -100,15 +120,21 @@ class IterationOutcome(BaseModel):
     id: uuid.UUID = Field(default_factory=uuid.uuid4)  # 提前生成,供 tracer 关联 iteration_id
     iteration_no: int
     artifact_snapshot: dict[str, Any] = Field(default_factory=dict)
-    score: VerifyScore = Field(default_factory=VerifyScore)
-    decision: str = DECISION_PASS                    # pass / retry_patch / retry_rewrite / exceed
-    repair_action: RepairAction | None = None        # decision 为 retry_* 时非空
+    score: VerifyScore | None = None
+    decision: str = DECISION_PASS
+    repair_action: RepairAction | None = None  # decision 为 retry_* 时非空
     duration_ms: int = 0
 
 
 __all__ = [
     "RubricDim",
     "RubricDef",
+    "QualityStatus",
+    "QUALITY_PASSED",
+    "QUALITY_FAILED",
+    "QUALITY_JUDGE_ERROR",
+    "QUALITY_UNAVAILABLE",
+    "QUALITY_SKIPPED",
     "VerifyScore",
     "RepairAction",
     "IterationOutcome",
@@ -116,4 +142,6 @@ __all__ = [
     "DECISION_RETRY_PATCH",
     "DECISION_RETRY_REWRITE",
     "DECISION_EXCEED",
+    "DECISION_JUDGE_ERROR",
+    "DECISION_EXECUTION_ERROR",
 ]

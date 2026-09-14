@@ -43,9 +43,16 @@ export interface AgentBriefItem {
 export interface LoopHealthData {
   days: number
   total: number
+  judged_total: number
   passed: number
+  failed_quality: number
+  judge_error: number
+  unavailable: number
+  skipped: number
+  // 旧客户端兼容投影
   exceeded: number
   failed: number
+  pass_rate: number            // passed / (passed + failed_quality)
   one_shot_pass_rate: number   // 一次通过率 0~1
   avg_iterations: number
   avg_final_score: number

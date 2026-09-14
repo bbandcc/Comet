@@ -4,8 +4,9 @@ V0.0.5 ② Loop Engineering 落地的状态外置层:
 - `loop_runs`:一次完整 Loop(对应一份研究报告或一次定时任务结果)
 - `loop_iterations`:Loop 内每一轮 generate→verify→decide 的详细记录
 
-状态外置 = 进程崩了/worker 重启也能从 checkpoint 恢复;每轮回炉决策完整 audit trail。
+当前持久记录用于完整 audit trail,并为后续 S4 的恢复能力打基础。
 """
+
 import uuid
 from datetime import datetime
 
@@ -30,10 +31,10 @@ TASK_TYPE_AGENT_TASK = "agent_task"
 # status 枚举
 STATUS_RUNNING = "running"
 STATUS_PASSED = "passed"
-STATUS_FAILED = "failed"      # 异常崩溃
+STATUS_FAILED = "failed"  # 异常崩溃
 STATUS_EXCEEDED = "exceeded"  # 超过最大迭代仍未通过
 
-# decision 枚举(每轮迭代的决策)
+# 旧 decision 常量（S3a 的 judge_error 定义在领域 models 中）
 DECISION_PASS = "pass"
 DECISION_RETRY_PATCH = "retry_patch"
 DECISION_RETRY_REWRITE = "retry_rewrite"
@@ -48,21 +49,19 @@ class LoopRun(Base):
 
     __tablename__ = "loop_runs"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), index=True
     )
     # 任务类型:research / agent_task / 未来扩展
     task_type: Mapped[str] = mapped_column(String(32), index=True)
     # 关联的业务 id(research_reports.id / agent_tasks.id);不加 FK 以解耦,业务删除不应级联清 loop
-    task_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), nullable=True, index=True
-    )
+    task_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, index=True)
 
     # 状态机:running / passed / failed / exceeded
     status: Mapped[str] = mapped_column(String(16), default=STATUS_RUNNING, index=True)
+    # S3a 质量真值；status 保留为旧执行/结果兼容字段，二者不得混用。
+    quality_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
     # 迭代次数(实际跑了几轮 verify;通过/超限/失败都计入)
     iterations: Mapped[int] = mapped_column(Integer, default=0)
     # 最终加权总分(0~1)
@@ -74,7 +73,7 @@ class LoopRun(Base):
     # 模型审计:generator/verifier 用了什么模型(便于后续对比实验)
     generator_model: Mapped[str | None] = mapped_column(String(128), nullable=True)
     verifier_model: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    # verifier 配置:same(同模型 critic)/ cross(跨 family);A/B 实验时区分
+    # verifier 配置:same(同模型 critic)/ cross(独立 verifier 配置)
     verifier_kind: Mapped[str | None] = mapped_column(String(16), nullable=True)
     # 用的 rubric 名(research / task / 未来扩展)
     rubric_name: Mapped[str | None] = mapped_column(String(32), nullable=True)
@@ -82,9 +81,7 @@ class LoopRun(Base):
     # 失败/超限时的简要原因(给前端展示)
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    started_at: Mapped[datetime] = mapped_column(
-        server_default=func.now(), nullable=False
-    )
+    started_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
     finished_at: Mapped[datetime | None] = mapped_column(nullable=True)
 
 
@@ -93,9 +90,7 @@ class LoopIteration(Base):
 
     __tablename__ = "loop_iterations"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     run_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("loop_runs.id", ondelete="CASCADE"),
@@ -113,13 +108,11 @@ class LoopIteration(Base):
     # verifier 给的具体问题(供 repair 消费;含 missing_coverage / wrong_citations / weak_chapters 等)
     feedback: Mapped[dict] = mapped_column(JSONB, default=dict)
 
-    # 决策:pass / retry_patch / retry_rewrite / exceed
+    # 决策:pass / retry_patch / retry_rewrite / exceed / judge_error / execution_error
     decision: Mapped[str] = mapped_column(String(16))
     # 本轮选的修复动作详情(retry_* 时非空;含 patch queries / 重写章节列表 等)
     repair_action: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
     # 本轮耗时(毫秒,含 generate + verify;repair 算在下一轮的 generate)
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(
-        server_default=func.now(), nullable=False
-    )
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)

@@ -1,4 +1,5 @@
 """深度研究路由：发起流式研究 + 续传 + 报告管理 + 存知识库。"""
+
 import uuid
 
 from fastapi import APIRouter, Depends, Query
@@ -121,7 +122,7 @@ async def get_report_loop(
     """V0.0.5 ② Verifier Loop 详情:LoopRun + 各轮 iteration 明细。
 
     前端「质量评分卡」用它拉雷达图维度分 + 各轮 feedback + 模型审计。
-    报告生成时未跑 verifier(开关关闭或 engine 内部异常)时返回 None,前端不显示评分卡。
+    历史数据无 LoopRun 时返回 None；关闭审稿以 quality_status=skipped 展示。
     """
     return success(await ResearchService(session).get_loop_detail(user.id, report_id))
 
@@ -156,9 +157,7 @@ async def share_report(
 ):
     """生成/刷新报告的公开只读分享链接。"""
     service = ReportShareService(session)
-    share = await service.create_share(
-        user.id, report_id, body.expire_days, body.title
-    )
+    share = await service.create_share(user.id, report_id, body.expire_days, body.title)
     return success(service.share_out(share), "已生成分享链接")
 
 
@@ -181,9 +180,7 @@ async def export_report_docx(
     filename = quote(f"{title}.docx")
     return Response(
         content=data,
-        media_type=(
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        ),
+        media_type=("application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
         headers={
             "Content-Disposition": f"attachment; filename*=UTF-8''{filename}",
         },

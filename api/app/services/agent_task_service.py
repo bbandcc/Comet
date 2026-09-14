@@ -3,6 +3,7 @@
 调度本身由 Celery beat 每分钟心跳扫表触发（见 tasks/agent_task.py），本服务只管
 任务的增删改查与 next_run_at 维护。
 """
+
 import uuid
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -69,9 +70,7 @@ class AgentTaskService:
         self.session = session
         self.repo = AgentTaskRepository(session)
 
-    async def create(
-        self, user_id: uuid.UUID, body: AgentTaskUpsertRequest
-    ) -> AgentTask:
+    async def create(self, user_id: uuid.UUID, body: AgentTaskUpsertRequest) -> AgentTask:
         self._validate(body)
         task = AgentTask(
             user_id=user_id,
@@ -107,9 +106,7 @@ class AgentTaskService:
         task.next_run_at = compute_next_run(task) if body.enabled else None
         return await self.repo.save(task)
 
-    async def set_enabled(
-        self, user_id: uuid.UUID, task_id: uuid.UUID, enabled: bool
-    ) -> AgentTask:
+    async def set_enabled(self, user_id: uuid.UUID, task_id: uuid.UUID, enabled: bool) -> AgentTask:
         task = await self._get_or_404(user_id, task_id)
         task.enabled = enabled
         task.next_run_at = compute_next_run(task) if enabled else None
@@ -133,8 +130,7 @@ class AgentTaskService:
     async def list_runs(self, user_id: uuid.UUID, task_id: uuid.UUID) -> list[dict]:
         """某任务的运行历史（复用 research_reports，task_id 关联）。
 
-        V0.0.5 ② 起,每条 run 附 `verified`(passed/exceeded/failed/none)+ `final_score`,
-        前端能直接显示评分徽章。无 LoopRun 时 verified='none' 不影响展示。
+        每条 run 附独立 quality_status；verified 保留旧 LoopRun.status 兼容值域。
         """
         from app.core.agent.loop.store import LoopStore
         from app.models.loop_model import LoopRun
@@ -144,9 +140,7 @@ class AgentTaskService:
         from sqlalchemy import select
 
         await self._get_or_404(user_id, task_id)
-        reports = await ResearchReportRepository(self.session).list_by_task(
-            user_id, task_id
-        )
+        reports = await ResearchReportRepository(self.session).list_by_task(user_id, task_id)
         report_ids = [r.id for r in reports]
 
         # 批量查这些 report 对应的最新 LoopRun(避免 N+1)
@@ -171,8 +165,11 @@ class AgentTaskService:
                 "status": r.status,
                 "error_msg": r.error_msg,
                 "created_at": r.created_at.isoformat() if r.created_at else None,
-                "verified": (
-                    loop_by_report[r.id].status if r.id in loop_by_report else "none"
+                "verified": (loop_by_report[r.id].status if r.id in loop_by_report else "none"),
+                "quality_status": (
+                    (loop_by_report[r.id].quality_status or "none")
+                    if r.id in loop_by_report
+                    else "none"
                 ),
                 "final_score": (
                     loop_by_report[r.id].final_score if r.id in loop_by_report else None
@@ -190,9 +187,7 @@ class AgentTaskService:
 
         user = await self.session.get(User, user_id)
         since = user.briefing_seen_at if user else None
-        return await ResearchReportRepository(self.session).count_unread_scheduled(
-            user_id, since
-        )
+        return await ResearchReportRepository(self.session).count_unread_scheduled(user_id, since)
 
     async def mark_seen(self, user_id: uuid.UUID) -> None:
         """把「上次查看简报时间」更新为现在，清未读红点。"""
@@ -203,9 +198,7 @@ class AgentTaskService:
             user.briefing_seen_at = datetime.now(TZ)
             await self.session.commit()
 
-    async def _get_or_404(
-        self, user_id: uuid.UUID, task_id: uuid.UUID
-    ) -> AgentTask:
+    async def _get_or_404(self, user_id: uuid.UUID, task_id: uuid.UUID) -> AgentTask:
         task = await self.repo.get(user_id, task_id)
         if not task:
             raise BizError("任务不存在", code=3060, status_code=404)
