@@ -1,8 +1,10 @@
 """ResearchReport 数据访问层 —— PostgreSQL research_reports 表。所有查询带 user_id 隔离。"""
+
 import uuid
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import defer
 
 from app.models.research_report_model import ResearchReport
 
@@ -22,25 +24,35 @@ class ResearchReportRepository:
         await self.session.refresh(report)
         return report
 
-    async def get(
-        self, user_id: uuid.UUID, report_id: uuid.UUID
-    ) -> ResearchReport | None:
-        stmt = select(ResearchReport).where(
-            ResearchReport.id == report_id, ResearchReport.user_id == user_id
+    async def get(self, user_id: uuid.UUID, report_id: uuid.UUID) -> ResearchReport | None:
+        stmt = (
+            select(ResearchReport)
+            .options(defer(ResearchReport.evidence_sources))
+            .where(ResearchReport.id == report_id, ResearchReport.user_id == user_id)
         )
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
     async def get_by_id(self, report_id: uuid.UUID) -> ResearchReport | None:
         """后台任务用：仅按 id 取（无 user 过滤，调用方已知归属）。"""
-        stmt = select(ResearchReport).where(ResearchReport.id == report_id)
+        stmt = (
+            select(ResearchReport)
+            .options(defer(ResearchReport.evidence_sources))
+            .where(ResearchReport.id == report_id)
+        )
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
     async def list_paged(
         self, user_id: uuid.UUID, page: int, page_size: int
     ) -> tuple[list[ResearchReport], int]:
-        base = select(ResearchReport).where(ResearchReport.user_id == user_id)
+        base = (
+            select(ResearchReport)
+            .options(defer(ResearchReport.evidence_sources))
+            .where(ResearchReport.user_id == user_id)
+        )
         total = await self.session.scalar(
-            select(func.count()).select_from(base.subquery())
+            select(func.count())
+            .select_from(ResearchReport)
+            .where(ResearchReport.user_id == user_id)
         )
         result = await self.session.execute(
             base.order_by(ResearchReport.created_at.desc())
@@ -55,6 +67,7 @@ class ResearchReportRepository:
         """某定时任务的运行历史（按时间倒序）。"""
         stmt = (
             select(ResearchReport)
+            .options(defer(ResearchReport.evidence_sources))
             .where(
                 ResearchReport.user_id == user_id,
                 ResearchReport.task_id == task_id,
@@ -64,17 +77,29 @@ class ResearchReportRepository:
         )
         return list((await self.session.execute(stmt)).scalars().all())
 
-    async def count_unread_scheduled(
-        self, user_id: uuid.UUID, since
-    ) -> int:
+    async def get_evidence_sources(
+        self, user_id: uuid.UUID, report_id: uuid.UUID
+    ) -> list[dict] | None:
+        """内部证据 resolver 专用；只读取证据列并保留用户隔离。"""
+        stmt = select(ResearchReport.evidence_sources).where(
+            ResearchReport.id == report_id,
+            ResearchReport.user_id == user_id,
+        )
+        return await self.session.scalar(stmt)
+
+    async def count_unread_scheduled(self, user_id: uuid.UUID, since) -> int:
         """统计「定时任务产出且已完成」、created_at 晚于 since 的报告数（未读红点用）。
 
         since 为 None 时视为全部未读（用户从未看过简报）。
         """
-        stmt = select(func.count()).select_from(ResearchReport).where(
-            ResearchReport.user_id == user_id,
-            ResearchReport.task_id.isnot(None),
-            ResearchReport.status == "done",
+        stmt = (
+            select(func.count())
+            .select_from(ResearchReport)
+            .where(
+                ResearchReport.user_id == user_id,
+                ResearchReport.task_id.isnot(None),
+                ResearchReport.status == "done",
+            )
         )
         if since is not None:
             stmt = stmt.where(ResearchReport.created_at > since)

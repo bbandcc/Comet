@@ -24,11 +24,12 @@
 {{ artifact_markdown }}
 ```
 
-## 引用来源(便于核对引用对齐)
+## 引用证据
 
-{% for s in sources -%}
-- [来源 {{ s.index }}] {{ s.title }}{% if s.url %} ({{ s.url }}){% endif %}
-{% endfor %}
+`content_ref` 仅用于审计追溯；Judge 无法自行读取它，只能依据下面实际提供的 evidence excerpt 评分。
+`omitted: true` 只表示该来源正文因预算未提供，不得仅据此判定来源错误或不可信。
+
+{{ evidence_context }}
 
 ## 输出格式(严格 JSON,不要任何代码块包裹)
 

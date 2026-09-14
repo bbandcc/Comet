@@ -7,7 +7,9 @@
 - 各函数接受可选 emit 回调（异步），实时上报细粒度进度（搜索/抓取/命中/调用工具），
   供编排器转成活动流推给前端。emit 失败不影响检索。
 """
+
 import asyncio
+import json
 import uuid
 from collections.abc import Awaitable, Callable
 
@@ -50,23 +52,32 @@ def _short_url(url: str) -> str:
         return url[:40]
 
 
-def _truncate(text: str) -> str:
-    text = (text or "").strip()
-    limit = settings.research_source_truncate_chars
-    return text[:limit] + "…" if len(text) > limit else text
-
-
 # 域名权威性启发式词表（确定性快速打分，无需额外 LLM 调用）。
 # 命中即加分；这是经验性优先级，不是黑白名单，未命中的域名仍按充实度参与排序。
 _AUTHORITATIVE_TLDS = (".gov.cn", ".edu.cn", ".gov", ".edu", ".ac.cn", ".org.cn")
 _AUTHORITATIVE_DOMAINS = {
     # 官方统计 / 权威媒体
-    "stats.gov.cn", "people.com.cn", "xinhuanet.com", "cctv.com",
-    "caixin.com", "yicai.com", "ce.cn", "gov.cn",
+    "stats.gov.cn",
+    "people.com.cn",
+    "xinhuanet.com",
+    "cctv.com",
+    "caixin.com",
+    "yicai.com",
+    "ce.cn",
+    "gov.cn",
     # 科技 / 学术 / 开发者权威
-    "36kr.com", "infoq.cn", "github.com", "arxiv.org", "nature.com",
-    "sciencedirect.com", "wikipedia.org", "juejin.cn", "csdn.net",
-    "segmentfault.com", "ieee.org", "acm.org",
+    "36kr.com",
+    "infoq.cn",
+    "github.com",
+    "arxiv.org",
+    "nature.com",
+    "sciencedirect.com",
+    "wikipedia.org",
+    "juejin.cn",
+    "csdn.net",
+    "segmentfault.com",
+    "ieee.org",
+    "acm.org",
 }
 # 内容农场 / 聚合营销号（时效与可信度通常较差，降权但不直接丢弃）
 _LOW_QUALITY_HINTS = ("baijiahao.baidu.com", "baidu.com/s", "sohu.com/a")
@@ -115,9 +126,7 @@ def _rank_and_filter_web(sources: list["Source"]) -> list["Source"]:
     return kept
 
 
-async def get_websearch_config(
-    session: AsyncSession, user_id: uuid.UUID
-) -> tuple[str, str] | None:
+async def get_websearch_config(session: AsyncSession, user_id: uuid.UUID) -> tuple[str, str] | None:
     """取用户默认 websearch 配置 (provider, 明文 key)；无则 None。"""
     from app.core.security import decrypt_secret
     from app.repositories.model_config_repository import ModelConfigRepository
@@ -130,6 +139,7 @@ async def get_websearch_config(
 
 
 # ── A. 联网搜索 + 抓正文（质量主力）──
+
 
 async def gather_web_sources(
     provider: str, api_key: str, queries: list[str], emit: EmitFn | None = None
@@ -166,9 +176,7 @@ async def gather_web_sources(
                     res = await web_search_structured(
                         provider, api_key, q, top_k=settings.research_search_top_k
                     )
-                    await _emit(
-                        emit, icon="search", ok=True, text=f"已搜索：{q}（{len(res)} 条）"
-                    )
+                    await _emit(emit, icon="search", ok=True, text=f"已搜索：{q}（{len(res)} 条）")
                     return res
                 except Exception as e:
                     last_err = e
@@ -188,9 +196,10 @@ async def gather_web_sources(
     for results in results_per_query:
         for r in results:
             url = (r.get("url") or "").strip()
-            if not url or url in by_url:
+            normalized = Source.normalize_web_url(url)
+            if not normalized or normalized in by_url:
                 continue
-            by_url[url] = r
+            by_url[normalized] = r
     candidates = list(by_url.values())[: settings.research_fetch_top_n]
     await _emit(
         emit,
@@ -215,27 +224,43 @@ async def gather_web_sources(
                 )
                 title = fetched_title or title
                 body = content
-                await _emit(
-                    emit, icon="fetch", ok=True, text=f"已读取：{title[:40]}", url=url
-                )
+                fetch_status = "full"
+                await _emit(emit, icon="fetch", ok=True, text=f"已读取：{title[:40]}", url=url)
             except (TimeoutError, asyncio.TimeoutError):
                 logger.warning("研究抓正文超时，用摘要兜底: url=%s", url)
                 body = snippet
+                fetch_status = "fallback"
                 await _emit(
-                    emit, icon="fetch", ok=False,
-                    text=f"抓取超时，改用摘要：{_short_url(url)}", url=url,
+                    emit,
+                    icon="fetch",
+                    ok=False,
+                    text=f"抓取超时，改用摘要：{_short_url(url)}",
+                    url=url,
                 )
             except Exception as e:
                 logger.warning("研究抓正文失败，用摘要兜底: url=%s err=%s", url, e)
                 body = snippet
+                fetch_status = "fallback"
                 await _emit(
-                    emit, icon="fetch", ok=False,
-                    text=f"抓取失败，改用摘要：{_short_url(url)}", url=url,
+                    emit,
+                    icon="fetch",
+                    ok=False,
+                    text=f"抓取失败，改用摘要：{_short_url(url)}",
+                    url=url,
                 )
-        body = _truncate(body)
+        body = (body or "").strip()
         if not body:
             return None
-        return Source(index=0, type=SOURCE_WEB, title=title.strip()[:200], content=body, url=url)
+        return Source(
+            index=0,
+            type=SOURCE_WEB,
+            title=title.strip()[:200],
+            content=body,
+            url=url,
+            origin_ref=Source.normalize_web_url(url),
+            fetch_status=fetch_status,
+            truncated=False,
+        )
 
     fetched = await asyncio.gather(*[_fetch(r) for r in candidates])
     web_sources = [s for s in fetched if s is not None]
@@ -246,13 +271,16 @@ async def gather_web_sources(
     dropped = before - len(web_sources)
     if dropped > 0:
         await _emit(
-            emit, icon="web", ok=True,
+            emit,
+            icon="web",
+            ok=True,
             text=f"质量过滤：保留 {len(web_sources)} 个优质来源（剔除 {dropped} 个低质/抓取失败）",
         )
     return web_sources
 
 
 # ── B. 知识库检索（用户权威资料）──
+
 
 async def gather_kb_sources(
     session: AsyncSession,
@@ -302,25 +330,51 @@ async def gather_kb_sources(
             content = (h.get("content") or "").strip()
             if not content:
                 continue
-            if sid not in by_doc:
-                by_doc[sid] = {"title": name, "parts": []}
-            by_doc[sid]["parts"].append(content)
+            doc_key = (str(h.get("kb_id") or ""), str(sid))
+            if doc_key not in by_doc:
+                by_doc[doc_key] = {
+                    "title": name,
+                    "parts": {},
+                    "kb_id": str(h.get("kb_id") or ""),
+                    "source_id": str(h.get("source_id") or sid),
+                    "locations": [],
+                }
+            location = {
+                "kb_id": str(h.get("kb_id") or ""),
+                "source_id": str(h.get("source_id") or sid),
+                "source_type": str(h.get("source_type") or ""),
+                "retrieval_hit_chunk_id": str(h.get("chunk_id") or ""),
+                "content_chunk_id": str(h.get("content_chunk_id") or h.get("chunk_id") or ""),
+            }
+            location_key = json.dumps(location, sort_keys=True, separators=(",", ":"))
+            if content not in by_doc[doc_key]["parts"].values():
+                by_doc[doc_key]["parts"][location_key] = content
+            if location not in by_doc[doc_key]["locations"]:
+                by_doc[doc_key]["locations"].append(location)
 
     sources: list[Source] = []
     for info in by_doc.values():
-        merged = _truncate("\n\n".join(info["parts"]))
+        merged = "\n\n".join(info["parts"].values()).strip()
         if merged:
             sources.append(
-                Source(index=0, type=SOURCE_KB, title=info["title"][:200], content=merged)
+                Source(
+                    index=0,
+                    type=SOURCE_KB,
+                    title=info["title"][:200],
+                    content=merged,
+                    origin_ref=(f"kb:{info['kb_id']}:source:{info['source_id']}"),
+                    fetch_status="full",
+                    truncated=False,
+                    locations=info["locations"],
+                )
             )
     if sources:
-        await _emit(
-            emit, icon="kb", ok=True, text=f"知识库命中 {len(sources)} 篇相关资料"
-        )
+        await _emit(emit, icon="kb", ok=True, text=f"知识库命中 {len(sources)} 篇相关资料")
     return sources
 
 
 # ── C. MCP 增强（专注工具，强模型 + 已配 MCP 才跑）──
+
 
 async def gather_mcp_sources(
     session: AsyncSession,
@@ -373,35 +427,68 @@ async def _run_mcp_loop(
         HumanMessage(content=f"研究主题：{topic}\n请用工具搜集相关资料。"),
     ]
     sources: list[Source] = []
-    seen: set[str] = set()
     max_iter = settings.research_mcp_max_iterations
     iter_count = 0
-    async for ev in run_function_calling(model, mcp_tools, messages):
+
+    async def _capture_outcome(call, outcome) -> None:
+        if outcome.status != "success" or not outcome.content.strip():
+            return
+        sources.append(
+            Source(
+                index=0,
+                type=SOURCE_MCP,
+                title=call.tool_key[:200],
+                content=outcome.content,
+                origin_ref=Source.mcp_origin_ref(call.tool_key, call.validated_args),
+                fetch_status="full",
+                truncated=False,
+                call_id=call.call_id,
+                artifact_ref=outcome.artifact_ref,
+            )
+        )
+
+    async for ev in run_function_calling(
+        model,
+        mcp_tools,
+        messages,
+        outcome_handler=_capture_outcome,
+    ):
         etype = ev.get("type")
         if etype == "tool_start":
             iter_count += 1
-            await _emit(
-                emit, icon="mcp", ok=True, text=f"调用工具：{ev.get('tool', '')}"
-            )
+            await _emit(emit, icon="mcp", ok=True, text=f"调用工具：{ev.get('tool', '')}")
             if iter_count > max_iter:
                 break
-        elif etype == "tool_result" and ev.get("status") == "success":
-            text = (ev.get("text") or "").strip()
-            tool = ev.get("tool") or "MCP 工具"
-            key = f"{tool}:{text[:80]}"
-            if text and key not in seen:
-                seen.add(key)
-                sources.append(
-                    Source(
-                        index=0,
-                        type=SOURCE_MCP,
-                        title=tool[:200],
-                        content=_truncate(text),
-                    )
-                )
         elif etype == "final":
             break
-    return sources
+    unique, _ = deduplicate_sources([], sources)
+    for source in unique:
+        source.index = 0
+    return unique
+
+
+def deduplicate_sources(
+    existing: list[Source], candidates: list[Source]
+) -> tuple[list[Source], list[Source]]:
+    """按稳定证据身份合并来源，并只给新增证据分配新展示编号。"""
+    merged = list(existing)
+    seen = {source.stable_id for source in existing}
+    added: list[Source] = []
+    next_index = max((source.index for source in existing), default=0) + 1
+    for source in candidates:
+        if source.stable_id in seen:
+            existing_source = next(item for item in merged if item.stable_id == source.stable_id)
+            previous_hash = existing_source.content_hash
+            existing_source.merge_evidence(source)
+            if existing_source.content_hash != previous_hash and existing_source not in added:
+                added.append(existing_source)
+            continue
+        source.index = next_index
+        next_index += 1
+        seen.add(source.stable_id)
+        merged.append(source)
+        added.append(source)
+    return merged, added
 
 
 def assign_indices(sources: list[Source], start: int = 1) -> list[Source]:
@@ -417,4 +504,5 @@ __all__ = [
     "gather_kb_sources",
     "gather_mcp_sources",
     "assign_indices",
+    "deduplicate_sources",
 ]

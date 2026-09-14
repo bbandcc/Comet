@@ -34,7 +34,7 @@ from app.core.agent.research.models import (
 from app.core.agent.research.planner import make_plan
 from app.core.agent.research.reflector import find_gap_queries
 from app.core.agent.research.retriever import (
-    assign_indices,
+    deduplicate_sources,
     gather_kb_sources,
     gather_mcp_sources,
     gather_web_sources,
@@ -93,6 +93,20 @@ def _source_brief(sources: list[Source]) -> list[dict]:
     return [{"index": s.index, "type": s.type, "title": s.title, "url": s.url} for s in sources]
 
 
+def _public_loop_event(event: dict[str, Any]) -> dict[str, Any]:
+    """移除 Loop final_artifact 中的内部证据正文后再交给传输层。"""
+    final_artifact = event.get("final_artifact")
+    if not isinstance(final_artifact, dict):
+        return event
+    public_artifact = dict(final_artifact)
+    public_artifact["sources"] = [
+        {key: source.get(key) for key in ("index", "type", "title", "url") if key in source}
+        for source in final_artifact.get("sources") or []
+        if isinstance(source, dict)
+    ]
+    return {**event, "final_artifact": public_artifact}
+
+
 def _build_markdown(
     title: str,
     summary: dict,
@@ -124,6 +138,34 @@ def _build_markdown(
         lines += [f"{s.index}. {s.cite_label()}" for s in sources]
         lines.append("")
     return "\n".join(lines).strip() + "\n"
+
+
+def _build_verifier_artifact(
+    title: str,
+    summary: dict,
+    sections: list[tuple[str, str]],
+    sources: list[Source],
+) -> dict[str, Any]:
+    """在展示 linkify 前保留正文真实引用号，供 Verifier 分配证据预算。"""
+    raw_texts = [str(summary.get("tldr") or "")]
+    raw_texts.extend(str(point) for point in summary.get("key_points") or [])
+    raw_texts.extend(content for _, content in sections)
+    available_indices = {source.index for source in sources}
+    cited_indices = sorted(
+        {
+            int(match)
+            for text in raw_texts
+            for match in _CITATION_RE.findall(text)
+            if int(match) in available_indices
+        }
+    )
+    return {
+        "title": title,
+        "markdown": _build_markdown(title, summary, sections, sources),
+        "sources": [source.as_verifier_evidence() for source in sources],
+        "headings": [heading for heading, _ in sections],
+        "cited_source_indices": cited_indices,
+    }
 
 
 async def _pump(holder: dict, make_task) -> AsyncGenerator[dict, None]:
@@ -213,7 +255,7 @@ async def run_research(
         }
 
         # ── 检索辅助（一轮：四源并行 + 续编引用号）──
-        async def _retrieve(emit, queries: list[str], start_index: int) -> list[Source]:
+        async def _retrieve(emit, queries: list[str]) -> list[Source]:
             async with tracer.span(
                 f"检索:{len(queries)} 个角度",
                 span_type="retriever",
@@ -259,7 +301,7 @@ async def run_research(
                 except Exception as e:
                     logger.warning("研究 MCP 增强整体失败（继续）: %s", e)
                 rsp.set_payload("source_count", len(collected))
-                return assign_indices(collected, start=start_index)
+                return collected
 
         # ── 2. 检索（第一轮）──
         yield {
@@ -268,9 +310,9 @@ async def run_research(
             "detail": f"正在围绕 {len(plan.queries)} 个角度检索并抓取资料…",
         }
         h1: dict = {}
-        async for ev in _pump(h1, lambda emit: _retrieve(emit, plan.queries, 1)):
+        async for ev in _pump(h1, lambda emit: _retrieve(emit, plan.queries)):
             yield ev
-        sources: list[Source] = h1.get("result") or []
+        sources, _ = deduplicate_sources([], h1.get("result") or [])
         yield {"type": "sources", "sources": _source_brief(sources)}
 
         # ── 3. 逐源提炼（v2 核心：原始资料 → 带来源号的要点）──
@@ -305,13 +347,10 @@ async def run_research(
                     "detail": f"补充检索 {len(gap_queries)} 个缺口角度…",
                 }
                 h3: dict = {}
-                async for ev in _pump(
-                    h3, lambda emit: _retrieve(emit, gap_queries, len(sources) + 1)
-                ):
+                async for ev in _pump(h3, lambda emit: _retrieve(emit, gap_queries)):
                     yield ev
-                extra_sources: list[Source] = h3.get("result") or []
+                sources, extra_sources = deduplicate_sources(sources, h3.get("result") or [])
                 if extra_sources:
-                    sources += extra_sources
                     yield {"type": "sources", "sources": _source_brief(sources)}
                     h4: dict = {}
                     async with tracer.span(
@@ -392,26 +431,18 @@ async def run_research(
         loop_summary: dict = dict(summary or {})
 
         def _rebuild_artifact() -> dict[str, Any]:
-            md = _build_markdown(plan.title, loop_summary, loop_written, loop_sources)
-            return {
-                "title": plan.title,
-                "markdown": md,
-                "sources": [
-                    {"index": s.index, "type": s.type, "title": s.title, "url": s.url}
-                    for s in loop_sources
-                ],
-                "headings": [h for h, _ in loop_written],
-            }
+            return _build_verifier_artifact(plan.title, loop_summary, loop_written, loop_sources)
 
         initial_artifact = _rebuild_artifact()
 
         async def patch_callback(queries: list[str]) -> dict[str, Any]:
             """Patch:用 verifier 给的子查询补搜补提炼,把新要点作为「补充信息」追加到报告。"""
             try:
-                new_sources = await _retrieve(None, queries, len(loop_sources) + 1)
+                candidates = await _retrieve(None, queries)
+                merged, new_sources = deduplicate_sources(loop_sources, candidates)
                 if not new_sources:
                     return _rebuild_artifact()
-                loop_sources.extend(new_sources)
+                loop_sources[:] = merged
                 new_learnings = await distill_sources(
                     model, topic, [h for h, _ in loop_written], new_sources, emit=None
                 )
@@ -495,7 +526,7 @@ async def run_research(
                 if ev.get("type") == "loop_finished":
                     final = ev.get("final_artifact") or {}
                     final_markdown = final.get("markdown") or final_markdown
-                yield ev
+                yield _public_loop_event(ev)
         except Exception as e:  # noqa: BLE001
             # Loop 整体异常:沿用原报告,业务不阻断
             logger.warning("Verifier Loop 运行异常,沿用原报告: %s", e, exc_info=True)
@@ -504,10 +535,8 @@ async def run_research(
             "type": "report",
             "title": plan.title,
             "markdown": final_markdown,
-            "sources": [
-                {"index": s.index, "type": s.type, "title": s.title, "url": s.url}
-                for s in loop_sources
-            ],
+            "sources": _source_brief(loop_sources),
+            "_evidence_sources": [s.as_persisted_evidence() for s in loop_sources],
         }
 
 

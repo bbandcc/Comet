@@ -2,6 +2,7 @@
 
 强制 user_id 过滤做多租户隔离。命中子块后返回其父块内容提供更大上下文。
 """
+
 import uuid
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -120,9 +121,7 @@ async def hybrid_search(
     bm_n = _normalize(bm_scores)
     fused: dict[str, float] = {}
     for cid in hits:
-        fused[cid] = (
-            _VECTOR_WEIGHT * vec_n.get(cid, 0.0) + _BM25_WEIGHT * bm_n.get(cid, 0.0)
-        )
+        fused[cid] = _VECTOR_WEIGHT * vec_n.get(cid, 0.0) + _BM25_WEIGHT * bm_n.get(cid, 0.0)
 
     # 3.5 精确模式（全局搜索）：纯语义余弦门控
     # ES cosine knn 的 _score = (1 + cos) / 2 → cos = 2*score - 1
@@ -137,10 +136,11 @@ async def hybrid_search(
         results: list[dict] = []
         for cid in candidate_ids:
             src = hits[cid]
-            content = await _resolve_parent_content(es, uid, src)
+            content, content_chunk_id = await _resolve_parent_content(es, uid, cid, src)
             results.append(
                 {
                     "chunk_id": cid,
+                    "content_chunk_id": content_chunk_id,
                     "content": content,
                     "doc_name": src.get("doc_name"),
                     "source_id": src.get("source_id"),
@@ -168,10 +168,11 @@ async def hybrid_search(
     results: list[dict] = []
     for cid in candidate_ids[:top_k]:
         src = hits[cid]
-        content = await _resolve_parent_content(es, uid, src)
+        content, content_chunk_id = await _resolve_parent_content(es, uid, cid, src)
         results.append(
             {
                 "chunk_id": cid,
+                "content_chunk_id": content_chunk_id,
                 "content": content,
                 "doc_name": src.get("doc_name"),
                 "source_id": src.get("source_id"),
@@ -183,11 +184,13 @@ async def hybrid_search(
     return results
 
 
-async def _resolve_parent_content(es, user_id: str, child_src: dict) -> str:
-    """命中子块时取其父块内容，提供更大上下文；取不到则用子块本身。"""
+async def _resolve_parent_content(
+    es, user_id: str, child_chunk_id: str, child_src: dict
+) -> tuple[str, str]:
+    """返回实际正文及其块 ID；父块取不到时二者都回退到命中子块。"""
     parent_id = child_src.get("parent_id")
     if not parent_id:
-        return child_src.get("content", "")
+        return child_src.get("content", ""), child_chunk_id
     resp = await es.search(
         index=CHUNKS_INDEX,
         body={
@@ -204,5 +207,5 @@ async def _resolve_parent_content(es, user_id: str, child_src: dict) -> str:
     )
     docs = resp["hits"]["hits"]
     if docs:
-        return docs[0]["_source"].get("content", "")
-    return child_src.get("content", "")
+        return docs[0]["_source"].get("content", ""), parent_id
+    return child_src.get("content", ""), child_chunk_id

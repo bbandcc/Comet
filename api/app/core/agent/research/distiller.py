@@ -4,6 +4,7 @@
 干净要点"，既过滤噪声、又把引用对齐提前到提炼阶段（要点天然绑定 source_index）。
 并发执行，单源失败跳过不影响其余。
 """
+
 import asyncio
 from datetime import date
 
@@ -17,9 +18,6 @@ from app.core.logging import get_logger
 from app.core.memory.json_utils import parse_json_object
 
 logger = get_logger(__name__)
-
-# 提炼时给模型看的单源正文上限（再长也没必要，控 token）
-_MAX_SOURCE_CHARS = 4000
 
 
 async def _distill_one(
@@ -36,7 +34,7 @@ async def _distill_one(
         headings=headings,
         source_index=source.index,
         source_title=source.title,
-        source_content=(source.content or "")[:_MAX_SOURCE_CHARS],
+        source_content=(source.content or "")[: settings.research_source_truncate_chars],
         today=today,
     )
     try:

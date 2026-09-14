@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import uuid
 from typing import Any
 
@@ -32,6 +33,9 @@ from app.repositories.model_config_repository import ModelConfigRepository
 
 logger = get_logger(__name__)
 
+_JUDGE_EVIDENCE_TOTAL_CHARS = 12_000
+_JUDGE_EVIDENCE_SOURCE_CHARS = 4_000
+
 
 # ── 共用工具 ──
 
@@ -40,8 +44,90 @@ def _critic_role() -> str:
     return render_verifier_prompt("critic_role.jinja2")
 
 
+def _evidence_metadata(source: dict[str, Any]) -> str:
+    return (
+        f"[来源 {source.get('index', '')}] {str(source.get('title') or '')[:200]}\n"
+        f"url: {str(source.get('url') or '')[:500]}\n"
+        f"stable_id: {str(source.get('stable_id') or '')[:128]}\n"
+        f"origin_ref: {str(source.get('origin_ref') or '')[:300]}\n"
+        f"content_ref: {str(source.get('content_ref') or '')[:300]}\n"
+        f"fetch_status: {str(source.get('fetch_status') or '')[:32]}\n"
+    )
+
+
+def _render_source_block(source: dict[str, Any], budget: int) -> str | None:
+    metadata = _evidence_metadata(source)
+    fixed = metadata + "truncated: false\nevidence:\n"
+    if budget <= len(fixed):
+        return None
+    content = str(source.get("content") or "")
+    excerpt = content[: min(_JUDGE_EVIDENCE_SOURCE_CHARS, budget - len(fixed))]
+    truncated = bool(source.get("truncated")) or len(excerpt) < len(content)
+    block = metadata + f"truncated: {str(truncated).lower()}\nevidence:\n" + excerpt
+    return block if len(block) <= budget else None
+
+
+def _render_evidence_context(
+    sources: list[dict[str, Any]], cited_indices: set[int] | None = None
+) -> str:
+    """在确定性总字符预算内渲染 Judge 可见证据（含 metadata）。"""
+    cited_indices = cited_indices or set()
+    cited = [source for source in sources if source.get("index") in cited_indices]
+    uncited = [source for source in sources if source.get("index") not in cited_indices]
+    if cited:
+        omitted = [f"[来源 {source.get('index', '')}] omitted: true" for source in uncited]
+        omitted_text = "\n\n".join(omitted)
+        cited_budget = _JUDGE_EVIDENCE_TOTAL_CHARS - len(omitted_text)
+        if omitted_text:
+            cited_budget -= 2
+        blocks: list[str] = []
+        remaining = cited_budget
+        for position, source in enumerate(cited):
+            separator_size = 2 if blocks else 0
+            remaining -= separator_size
+            source_budget = remaining // (len(cited) - position)
+            block = _render_source_block(source, source_budget)
+            if block is None:
+                block = f"[来源 {source.get('index', '')}] omitted: true"
+            blocks.append(block)
+            remaining -= len(block)
+        if omitted_text:
+            blocks.append(omitted_text)
+        return "\n\n".join(blocks)[:_JUDGE_EVIDENCE_TOTAL_CHARS]
+
+    blocks: list[str] = []
+    remaining = _JUDGE_EVIDENCE_TOTAL_CHARS
+    for position, source in enumerate(uncited):
+        separator = "\n\n" if blocks else ""
+        remaining -= len(separator)
+        if remaining <= 0:
+            break
+        block = _render_source_block(source, remaining)
+        if block is None:
+            omitted = "\n\n".join(
+                f"[来源 {item.get('index', '')}] omitted: true" for item in uncited[position:]
+            )
+            if len(omitted) <= remaining:
+                blocks.append(omitted)
+            break
+        blocks.append(block)
+        remaining -= len(block)
+    return "\n\n".join(blocks)
+
+
 def _render_research_prompt(*, topic: str, rubric: RubricDef, artifact: dict[str, Any]) -> str:
     """渲染研究报告的 verifier prompt(给单条 user message,system 走 critic_role)。"""
+    structured_citations = artifact.get("cited_source_indices")
+    if isinstance(structured_citations, list):
+        cited_indices = {
+            value
+            for value in structured_citations
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0
+        }
+    else:
+        cited_indices = {
+            int(value) for value in re.findall(r"\[来源\s*(\d+)\]", artifact.get("markdown") or "")
+        }
     return render_verifier_prompt(
         "verify_research.jinja2",
         topic=topic,
@@ -52,7 +138,10 @@ def _render_research_prompt(*, topic: str, rubric: RubricDef, artifact: dict[str
         ],
         headings=artifact.get("headings") or [],
         artifact_markdown=(artifact.get("markdown") or "").strip(),
-        sources=artifact.get("sources") or [],
+        evidence_context=_render_evidence_context(
+            artifact.get("sources") or [],
+            cited_indices,
+        ),
     )
 
 

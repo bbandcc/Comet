@@ -5,6 +5,8 @@
 """
 
 import asyncio
+import hashlib
+import hmac
 import json
 import uuid
 from collections.abc import AsyncGenerator
@@ -12,6 +14,11 @@ from collections.abc import AsyncGenerator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.agent.research.engine import run_research
+from app.core.agent.research.evidence_store import (
+    delete_external_evidence,
+    prepare_evidence_sources,
+    read_external_evidence,
+)
 from app.core.exceptions import BizError
 from app.core.llm.chat_model import get_default_chat_config
 from app.core.logging import get_logger
@@ -35,6 +42,11 @@ _BUFFER_FLUSH_EVERY = 8
 
 def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def _public_report_event(event: dict) -> dict:
+    """过滤 Research 引擎仅供内部持久化的字段。"""
+    return {key: value for key, value in event.items() if not key.startswith("_")}
 
 
 class ResearchService:
@@ -190,6 +202,7 @@ class ResearchService:
         steps: list[dict] = []  # 活动流（搜索/抓取/命中/调用工具），续传补推
         final_md: str | None = None
         final_sources: list = []
+        final_evidence_sources: list = []
         final_title: str | None = None
 
         async def _flush(status: str = "generating") -> None:
@@ -259,8 +272,9 @@ class ResearchService:
                     elif etype == "report":
                         final_md = ev.get("markdown", "")
                         final_sources = ev.get("sources", [])
+                        final_evidence_sources = ev.get("_evidence_sources", [])
                         final_title = ev.get("title", title)
-                        await bus.publish(rid, "report", ev)
+                        await bus.publish(rid, "report", _public_report_event(ev))
                     elif etype and etype.startswith("loop_"):
                         # V0.0.5 ② Verifier Loop 全套事件透传给前端
                         # (loop_started / loop_verify_start / loop_verify_done /
@@ -280,6 +294,7 @@ class ResearchService:
                     final_md,
                     plan_snapshot,
                     final_sources,
+                    final_evidence_sources,
                 )
             await bus.clear_stream_buffer(rid)
             await bus.publish(rid, "done", {"report_id": rid})
@@ -321,6 +336,7 @@ class ResearchService:
         markdown: str,
         outline: dict | None,
         sources: list,
+        evidence_sources: list,
     ) -> None:
         repo = ResearchReportRepository(session)
         report = await repo.get_by_id(report_id)
@@ -330,9 +346,20 @@ class ResearchService:
         report.report_md = markdown
         report.outline = outline
         report.sources = sources
-        report.status = RESEARCH_STATUS_DONE
-        report.error_msg = None
-        await repo.save(report)
+        created_storage_refs: list[str] = []
+        try:
+            report.evidence_sources = await prepare_evidence_sources(
+                report.user_id,
+                report_id,
+                evidence_sources,
+                created_storage_refs=created_storage_refs,
+            )
+            report.status = RESEARCH_STATUS_DONE
+            report.error_msg = None
+            await repo.save(report)
+        except BaseException:
+            await delete_external_evidence(created_storage_refs)
+            raise
         logger.info("研究完成: report=%s title=%s", report_id, report.title)
 
     async def _fail(
@@ -447,6 +474,29 @@ class ResearchService:
         report = await self._get_or_404(user_id, report_id)
         return self.to_detail(report)
 
+    async def resolve_evidence_content(
+        self, user_id: uuid.UUID, report_id: uuid.UUID, content_ref: str
+    ) -> str | None:
+        """按报告和 content_ref 解析内部证据；不暴露为公共报告字段。"""
+        evidence_sources = await self.repo.get_evidence_sources(user_id, report_id)
+        source = next(
+            (item for item in evidence_sources or [] if item.get("content_ref") == content_ref),
+            None,
+        )
+        if source is None:
+            return None
+        storage_ref = source.get("storage_ref")
+        if storage_ref:
+            content = await read_external_evidence(str(storage_ref))
+        else:
+            raw_content = source.get("content")
+            content = str(raw_content) if raw_content is not None else None
+        expected_hash = str(source.get("content_hash") or "")
+        if content is None or not expected_hash:
+            return None
+        actual_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        return content if hmac.compare_digest(actual_hash, expected_hash) else None
+
     async def get_loop_detail(self, user_id: uuid.UUID, report_id: uuid.UUID) -> dict | None:
         """V0.0.5 ② Verifier Loop 详情:LoopRun + 各轮 iteration。
 
@@ -493,7 +543,14 @@ class ResearchService:
 
     async def delete(self, user_id: uuid.UUID, report_id: uuid.UUID) -> None:
         report = await self._get_or_404(user_id, report_id)
+        evidence_sources = await self.repo.get_evidence_sources(user_id, report_id)
         await self.repo.delete(report)
+        storage_refs = [
+            str(item.get("storage_ref"))
+            for item in evidence_sources or []
+            if item.get("storage_ref")
+        ]
+        await delete_external_evidence(storage_refs)
         logger.info("删除研究报告: user=%s id=%s", user_id, report_id)
 
     async def save_to_kb(

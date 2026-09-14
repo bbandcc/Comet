@@ -15,6 +15,7 @@
 """
 
 import asyncio
+import inspect
 import json
 import re
 import time
@@ -36,6 +37,7 @@ from app.core.agent.agent_contract import (
 )
 from app.core.agent.prompt_renderer import render_agent_prompt
 from app.core.agent.tool_execution import (
+    ToolCall,
     ToolCallValidationError,
     ToolExecutor,
     ToolOutcome,
@@ -104,6 +106,7 @@ async def run_function_calling(
     stats_holder: dict[str, dict] | None = None,
     limits: AgentRunLimits | None = None,
     clock: Callable[[], float] = time.monotonic,
+    outcome_handler: Callable[[ToolCall, ToolOutcome], object] | None = None,
 ) -> AsyncGenerator[dict, None]:
     """强模型路径：原生 function calling 流式工具循环。"""
     try:
@@ -302,6 +305,26 @@ async def run_function_calling(
                     partial_answer=_partial_answer(partial_parts),
                 ).as_event()
                 return
+            if outcome_handler is not None:
+                try:
+                    handled = outcome_handler(call, outcome)
+                    if inspect.isawaitable(handled):
+                        await handled
+                except asyncio.CancelledError:
+                    yield AgentTerminal(
+                        "cancelled",
+                        "external_cancellation",
+                        partial_answer=_partial_answer(partial_parts),
+                    ).as_event()
+                    raise
+                except Exception as exc:  # noqa: BLE001 - handler 是编排基础设施边界
+                    logger.warning("FC 工具结果 handler 失败: %s", exc)
+                    yield AgentTerminal(
+                        "failed",
+                        "outcome_handler_failed",
+                        partial_answer=_partial_answer(partial_parts),
+                    ).as_event()
+                    return
             yield tool_result_event(
                 call.call_id,
                 call.tool_key,

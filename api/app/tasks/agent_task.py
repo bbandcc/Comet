@@ -209,7 +209,14 @@ async def _execute_research(
     kb_ids: list[str] | None,
 ) -> bool:
     """消费研究引擎事件并落库（无 SSE/bus，后台直跑），带整体硬超时。"""
-    holder: dict = {"md": None, "sources": [], "title": None, "outline": None, "partial": ""}
+    holder: dict = {
+        "md": None,
+        "sources": [],
+        "evidence_sources": [],
+        "title": None,
+        "outline": None,
+        "partial": "",
+    }
 
     async def _collect(session: AsyncSession) -> None:
         async for ev in run_research(session, user_id, topic, kb_ids, report_id=report_id):
@@ -228,6 +235,7 @@ async def _execute_research(
             elif etype == "report":
                 holder["md"] = ev.get("markdown", "")
                 holder["sources"] = ev.get("sources", [])
+                holder["evidence_sources"] = ev.get("_evidence_sources", [])
                 holder["title"] = ev.get("title", holder["title"])
             elif etype == "error":
                 raise RuntimeError(ev.get("message", "研究失败"))
@@ -244,10 +252,26 @@ async def _execute_research(
                 report.title = (holder["title"] or topic)[:255]
                 report.report_md = holder["md"]
                 report.sources = holder["sources"]
-                report.outline = holder["outline"]
-                report.status = RESEARCH_STATUS_DONE
-                report.error_msg = None
-                await repo.save(report)
+                from app.core.agent.research.evidence_store import (
+                    delete_external_evidence,
+                    prepare_evidence_sources,
+                )
+
+                created_storage_refs: list[str] = []
+                try:
+                    report.evidence_sources = await prepare_evidence_sources(
+                        user_id,
+                        report_id,
+                        holder["evidence_sources"],
+                        created_storage_refs=created_storage_refs,
+                    )
+                    report.outline = holder["outline"]
+                    report.status = RESEARCH_STATUS_DONE
+                    report.error_msg = None
+                    await repo.save(report)
+                except BaseException:
+                    await delete_external_evidence(created_storage_refs)
+                    raise
         return True
     except (TimeoutError, asyncio.TimeoutError):
         msg = f"研究超时（超过 {settings.research_task_timeout} 秒）"

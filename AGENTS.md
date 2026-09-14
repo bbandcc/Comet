@@ -52,30 +52,22 @@ uv run ruff check app tests
 
 涉及并发、重试、超时、缓存或状态迁移时，测试必须控制时序并断言后置状态，不能只靠大量随机重复。依赖 Redis、数据库或浏览器的测试应使用隔离命名空间和独立测试数据，不操作开发者现有数据。
 
-## 当前切片：S3a Judge 状态
+## 当前切片：S3b 研究证据完整性
 
-- 质量状态固定区分 `passed / failed_quality / judge_error / unavailable / skipped`；执行状态与质量
-  状态分开表达，兼容保留现有 `LoopRun.status`，新增的持久质量字段必须有最小迁移。
-- Judge 正常输出必须是严格 JSON object；`raw_scores` 必须覆盖 rubric 全部维度，每项为
-  `0..raw_max` 内的有限 JSON number。非法 JSON、类型/字段错误、缺维度、NaN/Inf 和越界值均为
-  `judge_error`，不得伪造成零分或正常质量结果。
-- `feedback` 必须完整符合 prompt 的结构化字段与嵌套类型；只有 verifier 调用/解析失败属于
-  `judge_error`，policy/controller/repair-plan 等执行异常不得伪造 Judge 结论；未形成合法质量结论
-  时 `quality_status=None`，已有合法结论时保留。
-- cross verifier 配置缺失、查询失败或模型构建失败统一为 `unavailable`，不得静默降级 same；
-  `judge_error / unavailable / skipped` 不得触发 Patch/Rewrite。
-- `loop_enabled=False` 明确记录并展示 `skipped`，但报告继续交付；强质量门禁开启时，定时推送只
-  接受明确 `passed`，缺 run、查询失败及其他状态全部 fail-closed。
-- API、SSE 与前端只做质量状态的最小字段和展示同步，不建立新状态机，不改变报告交付、现有
-  Patch/Rewrite 算法及 S1/S2 契约。
-- Dashboard 五态 total 排除历史未知记录；通过率只以合法 judged runs 为分母，失败维度只读取
-  合法质量评分，未实际运行 Judge 的状态不进入 verifier kind 分布。
-- `iterations` 只统计实际发起的 Judge 调用；Judge 已形成合法 score 后，后续非 Judge 执行错误仍须
-  保留该轮审计记录，必要时使用 `execution_error` decision，但不得伪造新的质量状态。
-- cross 配置查询失败转为 `unavailable` 前应 best-effort rollback；当前落库只提供 audit trail 和
-  后续 S4 基础，不宣称已经支持崩溃后 computation resume。
-- 本切片不处理证据正文、preview/content、stable source/evidence id 或引用支持判断（S3b），
-  不修改断言定位与 Patch/Rewrite 算法（S3c），不进入 checkpoint、Memory 或 RAG。
+- `Source.stable_id` 只由稳定 origin identity 生成，内容版本由 `content_hash` 单独表达；引用
+  `index` 只负责报告展示，不参与证据身份。
+- 公共 `tool_result` 与 Research SSE 继续保持有界摘要；Research 通过内部 outcome 回调读取成功
+  工具的完整结果，并保留 `call_id / artifact_ref`，不得把完整正文泄露给 UI。
+- Web 明确区分正文抓取与摘要 fallback；KB 保留 knowledge base、source type/source id、检索命中
+  chunk 与实际正文 chunk 定位；持久全文与 Judge excerpt 的截断状态必须分开。
+- 同一研究 run 按稳定 origin 去重；Web 使用规范化 URL，KB/MCP 使用各自来源身份，
+  初搜、反思与质量修复补搜不得重复分配引用号。
+- Verifier artifact/prompt 必须包含稳定身份与有界证据正文；metadata 与正文共同受确定性总预算。
+  `content_ref` 仅供审计追溯，Judge 不能自行读取；完整证据不受 Judge 预算影响。
+- 普通报告查询不得默认加载完整证据；大证据超出 JSONB 内联上限时写入既有对象存储，不静默
+  截断，并通过内部 resolver 按 report + `content_ref` 读取。
+- 保持 S3a 五态质量状态、push gate 与 Patch/Rewrite 语义；本切片不实现 claim/evidence 绑定、
+  support/contradict 判定和错句修复（S3c），不进入 checkpoint、Memory 或 RAG。
 
 ## Git 规则
 
