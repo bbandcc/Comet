@@ -6,8 +6,9 @@
 设计取舍(每条都对应面试讲点):
 - 不是「不通过就重做」,按问题严重程度自动选最经济的修复
 - 多维全面烂(≥3 维不达硬门槛)→ ForceExceed,避免越改越乱
-- 上限默认 2 轮(token vs 收益取舍;N 轮内 70%+ 问题能在 Patch 阶段补完)
+- 上限默认 2 轮，在成本与修复机会之间取保守边界
 """
+
 from __future__ import annotations
 
 from app.core.agent.loop.models import (
@@ -63,18 +64,26 @@ class Policy:
         """
         # 1. 通过判定:加权总分 ≥ 阈值 且 所有单维 ≥ 硬门槛
         failed_dims = rubric.failed_dims(score.raw_scores)
-        if score.total >= rubric.pass_threshold and not failed_dims:
+        unresolved_claims = [
+            verdict
+            for verdict in (score.feedback or {}).get("claim_verdicts") or []
+            if isinstance(verdict, dict)
+            and verdict.get("status") in {"contradicted", "insufficient"}
+        ]
+        if score.total >= rubric.pass_threshold and not failed_dims and not unresolved_claims:
             return DECISION_PASS, None
 
         # 2. 已达迭代上限 → 强制停
         if iteration_no >= max_iterations:
             return DECISION_EXCEED, None
 
+        # 证据断言问题必须走定向 Patch，不能被高总分或 ChapterRewrite 掩盖。
+        if unresolved_claims:
+            return DECISION_RETRY_PATCH, self.patch_repair
+
         # 3. 多维全面烂 → 强制停(避免越改越乱)
         if len(failed_dims) >= self.full_failure_threshold:
-            logger.info(
-                "Policy: 多维全面烂(%d 维不达门槛),ForceExceed", len(failed_dims)
-            )
+            logger.info("Policy: 多维全面烂(%d 维不达门槛),ForceExceed", len(failed_dims))
             return DECISION_EXCEED, None
 
         # 4. 优先 ChapterRewrite:若有维度落在 _REWRITE_DIMS(论证深度 / 相关性),走章节重写

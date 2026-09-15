@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import re
 import uuid
@@ -55,22 +56,31 @@ def _evidence_metadata(source: dict[str, Any]) -> str:
     )
 
 
-def _render_source_block(source: dict[str, Any], budget: int) -> str | None:
+def _render_source_block(source: dict[str, Any], budget: int) -> tuple[str | None, bool]:
     metadata = _evidence_metadata(source)
     fixed = metadata + "truncated: false\nevidence:\n"
     if budget <= len(fixed):
-        return None
+        return None, False
     content = str(source.get("content") or "")
     excerpt = content[: min(_JUDGE_EVIDENCE_SOURCE_CHARS, budget - len(fixed))]
     truncated = bool(source.get("truncated")) or len(excerpt) < len(content)
     block = metadata + f"truncated: {str(truncated).lower()}\nevidence:\n" + excerpt
-    return block if len(block) <= budget else None
+    if len(block) > budget:
+        return None, False
+    return block, bool(excerpt)
 
 
-def _render_evidence_context(
+def _render_evidence_context_with_refs(
     sources: list[dict[str, Any]], cited_indices: set[int] | None = None
-) -> str:
-    """在确定性总字符预算内渲染 Judge 可见证据（含 metadata）。"""
+) -> tuple[str, set[str]]:
+    """渲染 Judge context，并返回本轮实际包含正文 excerpt 的 content refs。"""
+    visible_refs: set[str] = set()
+
+    def record_visible(source: dict[str, Any], has_excerpt: bool) -> None:
+        content_ref = source.get("content_ref")
+        if has_excerpt and isinstance(content_ref, str):
+            visible_refs.add(content_ref)
+
     cited_indices = cited_indices or set()
     cited = [source for source in sources if source.get("index") in cited_indices]
     uncited = [source for source in sources if source.get("index") not in cited_indices]
@@ -86,14 +96,16 @@ def _render_evidence_context(
             separator_size = 2 if blocks else 0
             remaining -= separator_size
             source_budget = remaining // (len(cited) - position)
-            block = _render_source_block(source, source_budget)
+            block, has_excerpt = _render_source_block(source, source_budget)
             if block is None:
                 block = f"[来源 {source.get('index', '')}] omitted: true"
+            else:
+                record_visible(source, has_excerpt)
             blocks.append(block)
             remaining -= len(block)
         if omitted_text:
             blocks.append(omitted_text)
-        return "\n\n".join(blocks)[:_JUDGE_EVIDENCE_TOTAL_CHARS]
+        return "\n\n".join(blocks)[:_JUDGE_EVIDENCE_TOTAL_CHARS], visible_refs
 
     blocks: list[str] = []
     remaining = _JUDGE_EVIDENCE_TOTAL_CHARS
@@ -102,7 +114,7 @@ def _render_evidence_context(
         remaining -= len(separator)
         if remaining <= 0:
             break
-        block = _render_source_block(source, remaining)
+        block, has_excerpt = _render_source_block(source, remaining)
         if block is None:
             omitted = "\n\n".join(
                 f"[来源 {item.get('index', '')}] omitted: true" for item in uncited[position:]
@@ -111,12 +123,19 @@ def _render_evidence_context(
                 blocks.append(omitted)
             break
         blocks.append(block)
+        record_visible(source, has_excerpt)
         remaining -= len(block)
-    return "\n\n".join(blocks)
+    return "\n\n".join(blocks), visible_refs
 
 
-def _render_research_prompt(*, topic: str, rubric: RubricDef, artifact: dict[str, Any]) -> str:
-    """渲染研究报告的 verifier prompt(给单条 user message,system 走 critic_role)。"""
+def _render_evidence_context(
+    sources: list[dict[str, Any]], cited_indices: set[int] | None = None
+) -> str:
+    """兼容调用方：只返回有界 Judge evidence 文本。"""
+    return _render_evidence_context_with_refs(sources, cited_indices)[0]
+
+
+def _artifact_evidence_context(artifact: dict[str, Any]) -> tuple[str, set[str]]:
     structured_citations = artifact.get("cited_source_indices")
     if isinstance(structured_citations, list):
         cited_indices = {
@@ -128,6 +147,12 @@ def _render_research_prompt(*, topic: str, rubric: RubricDef, artifact: dict[str
         cited_indices = {
             int(value) for value in re.findall(r"\[来源\s*(\d+)\]", artifact.get("markdown") or "")
         }
+    return _render_evidence_context_with_refs(artifact.get("sources") or [], cited_indices)
+
+
+def _render_research_prompt(*, topic: str, rubric: RubricDef, artifact: dict[str, Any]) -> str:
+    """渲染研究报告的 verifier prompt(给单条 user message,system 走 critic_role)。"""
+    evidence_context, _ = _artifact_evidence_context(artifact)
     return render_verifier_prompt(
         "verify_research.jinja2",
         topic=topic,
@@ -138,14 +163,127 @@ def _render_research_prompt(*, topic: str, rubric: RubricDef, artifact: dict[str
         ],
         headings=artifact.get("headings") or [],
         artifact_markdown=(artifact.get("markdown") or "").strip(),
-        evidence_context=_render_evidence_context(
-            artifact.get("sources") or [],
-            cited_indices,
-        ),
+        claims=artifact.get("claims") or [],
+        evidence_context=evidence_context,
     )
 
 
-def _parse_verify_response(text: str, rubric: RubricDef) -> VerifyScore:
+def _validate_claim_artifact(artifact: dict[str, Any]) -> None:
+    if "claims" not in artifact:
+        return
+    claims = artifact.get("claims")
+    version = artifact.get("artifact_version")
+    sources = artifact.get("sources")
+    if not isinstance(claims, list) or not isinstance(version, str) or not version:
+        raise JudgeError("Verifier artifact claim contract 非法")
+    if not isinstance(sources, list) or any(not isinstance(source, dict) for source in sources):
+        raise JudgeError("Verifier artifact sources 非法")
+
+    sources_by_index: dict[int, dict[str, Any]] = {}
+    for source in sources:
+        index = source.get("index")
+        content = source.get("content")
+        content_hash = source.get("content_hash")
+        content_ref = source.get("content_ref")
+        stable_id = source.get("stable_id")
+        if (
+            isinstance(index, bool)
+            or not isinstance(index, int)
+            or not isinstance(content, str)
+            or not isinstance(content_hash, str)
+            or not isinstance(content_ref, str)
+            or not isinstance(stable_id, str)
+        ):
+            raise JudgeError("Verifier artifact evidence version 非法")
+        actual_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        if actual_hash != content_hash or content_ref != f"evidence:{stable_id}:{content_hash}":
+            raise JudgeError("Verifier artifact evidence hash/ref 不匹配")
+        sources_by_index[index] = source
+
+    seen_claim_ids: set[str] = set()
+    for claim in claims:
+        if not isinstance(claim, dict):
+            raise JudgeError("Verifier artifact claim 必须是 object")
+        claim_id = claim.get("claim_id")
+        if (
+            not isinstance(claim_id, str)
+            or not claim_id
+            or claim_id in seen_claim_ids
+            or not isinstance(claim.get("section_id"), str)
+            or not isinstance(claim.get("claim_text"), str)
+            or isinstance(claim.get("locator_start"), bool)
+            or not isinstance(claim.get("locator_start"), int)
+            or claim["locator_start"] < 0
+            or isinstance(claim.get("locator_end"), bool)
+            or not isinstance(claim.get("locator_end"), int)
+            or claim["locator_end"] <= claim["locator_start"]
+            or claim.get("artifact_version") != version
+            or not isinstance(claim.get("cited_sources"), list)
+        ):
+            raise JudgeError("Verifier artifact claim 定位契约非法")
+        seen_claim_ids.add(claim_id)
+        for cited in claim["cited_sources"]:
+            if not isinstance(cited, dict):
+                raise JudgeError("Verifier artifact cited source 必须是 object")
+            source = sources_by_index.get(cited.get("index"))
+            if source is None:
+                raise JudgeError("断言引用号不属于当前 artifact")
+            if (
+                cited.get("content_ref") != source["content_ref"]
+                or cited.get("content_hash") != source["content_hash"]
+            ):
+                raise JudgeError("断言 evidence ref/hash 不是当前版本")
+
+
+def _validate_claim_verdicts(
+    feedback: dict[str, Any],
+    artifact: dict[str, Any],
+    visible_evidence_refs: set[str],
+) -> None:
+    if "claims" not in artifact:
+        return
+    verdicts = feedback.get("claim_verdicts")
+    if not isinstance(verdicts, list):
+        raise JudgeError("Judge feedback.claim_verdicts 必须是 array")
+    claims = {claim["claim_id"]: claim for claim in artifact.get("claims") or []}
+    seen: set[str] = set()
+    required_fields = {"claim_id", "status", "evidence_refs", "reason"}
+    for index, verdict in enumerate(verdicts):
+        if not isinstance(verdict, dict) or set(verdict) != required_fields:
+            raise JudgeError(f"Judge claim_verdicts[{index}] schema 非法")
+        claim_id = verdict.get("claim_id")
+        status = verdict.get("status")
+        evidence_refs = verdict.get("evidence_refs")
+        reason = verdict.get("reason")
+        if not isinstance(claim_id, str) or claim_id not in claims or claim_id in seen:
+            raise JudgeError(f"Judge claim_verdicts[{index}].claim_id 非法")
+        if status not in {"supported", "contradicted", "insufficient"}:
+            raise JudgeError(f"Judge claim_verdicts[{index}].status 非法")
+        claim_refs = {
+            cited.get("content_ref")
+            for cited in claims[claim_id].get("cited_sources") or []
+            if isinstance(cited, dict) and isinstance(cited.get("content_ref"), str)
+        }
+        if not isinstance(evidence_refs, list) or any(
+            not isinstance(ref, str) or ref not in claim_refs or ref not in visible_evidence_refs
+            for ref in evidence_refs
+        ):
+            raise JudgeError(f"Judge claim_verdicts[{index}].evidence_refs 非法")
+        if status != "insufficient" and not evidence_refs:
+            raise JudgeError(f"Judge claim_verdicts[{index}].evidence_refs 非法")
+        if not isinstance(reason, str) or not reason.strip():
+            raise JudgeError(f"Judge claim_verdicts[{index}].reason 非法")
+        seen.add(claim_id)
+    if seen != set(claims):
+        raise JudgeError("Judge claim_verdicts 未覆盖全部当前 claims")
+
+
+def _parse_verify_response(
+    text: str,
+    rubric: RubricDef,
+    artifact: dict[str, Any] | None = None,
+    visible_evidence_refs: set[str] | None = None,
+) -> VerifyScore:
     """严格解析 Judge JSON；非法输出不得形成质量分。"""
     try:
         data = json.loads(text)
@@ -213,6 +351,7 @@ def _parse_verify_response(text: str, rubric: RubricDef) -> VerifyScore:
         isinstance(value, bool) or not isinstance(value, int) for value in wrong_citations
     ):
         raise JudgeError("Judge feedback.wrong_citations 必须是 integer array")
+    _validate_claim_verdicts(feedback, artifact or {}, visible_evidence_refs or set())
     total = rubric.weighted_total(raw_scores)
     if not math.isfinite(total):
         raise JudgeError("Judge 加权分不是有限数字")
@@ -252,10 +391,12 @@ class SameModelVerifier(Verifier):
     async def verify(
         self, *, topic: str, artifact: dict[str, Any], rubric: RubricDef
     ) -> VerifyScore:
+        _validate_claim_artifact(artifact)
         system = _critic_role()
         user = _render_research_prompt(topic=topic, rubric=rubric, artifact=artifact)
+        _, visible_refs = _artifact_evidence_context(artifact)
         text = await _invoke_critic(self.model, system, user)
-        return _parse_verify_response(text, rubric)
+        return _parse_verify_response(text, rubric, artifact, visible_refs)
 
 
 # ── 独立配置 Verifier ──
@@ -276,10 +417,12 @@ class CrossModelVerifier(Verifier):
     async def verify(
         self, *, topic: str, artifact: dict[str, Any], rubric: RubricDef
     ) -> VerifyScore:
+        _validate_claim_artifact(artifact)
         system = _critic_role()
         user = _render_research_prompt(topic=topic, rubric=rubric, artifact=artifact)
+        _, visible_refs = _artifact_evidence_context(artifact)
         text = await _invoke_critic(self.model, system, user)
-        return _parse_verify_response(text, rubric)
+        return _parse_verify_response(text, rubric, artifact, visible_refs)
 
 
 # ── 工厂:按用户配置和 kind 选 verifier ──

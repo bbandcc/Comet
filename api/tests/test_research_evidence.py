@@ -553,6 +553,15 @@ class ResearchEvidenceTests(unittest.IsolatedAsyncioTestCase):
             "type": "loop_finished",
             "final_artifact": {
                 "markdown": "report",
+                "artifact_version": "internal-version",
+                "cited_source_indices": [1],
+                "claims": [
+                    {
+                        "claim_id": "internal-claim",
+                        "section_id": "section:1",
+                        "claim_text": "private claim",
+                    }
+                ],
                 "sources": [
                     {
                         "index": 1,
@@ -570,6 +579,9 @@ class ResearchEvidenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(public["final_artifact"]["markdown"], "report")
         self.assertNotIn("content", public["final_artifact"]["sources"][0])
         self.assertNotIn("stable_id", public["final_artifact"]["sources"][0])
+        self.assertNotIn("claims", public["final_artifact"])
+        self.assertNotIn("artifact_version", public["final_artifact"])
+        self.assertNotIn("internal-claim", str(public))
 
     def test_report_detail_does_not_expose_full_evidence(self):
         report = SimpleNamespace(

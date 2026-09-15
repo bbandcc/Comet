@@ -52,22 +52,20 @@ uv run ruff check app tests
 
 涉及并发、重试、超时、缓存或状态迁移时，测试必须控制时序并断言后置状态，不能只靠大量随机重复。依赖 Redis、数据库或浏览器的测试应使用隔离命名空间和独立测试数据，不操作开发者现有数据。
 
-## 当前切片：S3b 研究证据完整性
+## 当前切片：S3c 断言与证据修复
 
-- `Source.stable_id` 只由稳定 origin identity 生成，内容版本由 `content_hash` 单独表达；引用
-  `index` 只负责报告展示，不参与证据身份。
-- 公共 `tool_result` 与 Research SSE 继续保持有界摘要；Research 通过内部 outcome 回调读取成功
-  工具的完整结果，并保留 `call_id / artifact_ref`，不得把完整正文泄露给 UI。
-- Web 明确区分正文抓取与摘要 fallback；KB 保留 knowledge base、source type/source id、检索命中
-  chunk 与实际正文 chunk 定位；持久全文与 Judge excerpt 的截断状态必须分开。
-- 同一研究 run 按稳定 origin 去重；Web 使用规范化 URL，KB/MCP 使用各自来源身份，
-  初搜、反思与质量修复补搜不得重复分配引用号。
-- Verifier artifact/prompt 必须包含稳定身份与有界证据正文；metadata 与正文共同受确定性总预算。
-  `content_ref` 仅供审计追溯，Judge 不能自行读取；完整证据不受 Judge 预算影响。
-- 普通报告查询不得默认加载完整证据；大证据超出 JSONB 内联上限时写入既有对象存储，不静默
-  截断，并通过内部 resolver 按 report + `content_ref` 读取。
-- 保持 S3a 五态质量状态、push gate 与 Patch/Rewrite 语义；本切片不实现 claim/evidence 绑定、
-  support/contradict 判定和错句修复（S3c），不进入 checkpoint、Memory 或 RAG。
+- Research 必须在展示 linkify 前从原始摘要与章节构造内部 claim map；claim 使用稳定的
+  `section_id / claim_id` 定位，并绑定当前证据 `content_ref` 与 `artifact_version`。
+- Judge 必须对每条需证据断言严格返回 `supported / contradicted / insufficient`；伪造引用、
+  过期证据版本或非法 verdict schema 都属于 `judge_error`，不得形成质量结论或触发 repair。
+- `contradicted / insufficient` 必须优先进入定向 Patch；RepairAction 携带目标 claims 与
+  `artifact_version`，旧 action 不得修改新 artifact。
+- Patch 必须替换或删除旧断言和错引；补搜仍不足时改成明确的不确定表述，并在正文变化后重建
+  summary 与 verifier artifact。ChapterRewrite 仍只处理 depth/relevance。
+- Rubric 达标但仍有未解决的需证据断言不得通过；保持 S3a 五态、iteration/push gate 与 S3b
+  stable evidence、Judge 总预算、隐私和 storage 语义。
+- 本切片不新增质量状态或 migration，不实现完整 evidence event-store、checkpoint、Memory、
+  RAG 排序优化或前端大改。
 
 ## Git 规则
 

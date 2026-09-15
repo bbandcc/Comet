@@ -49,6 +49,22 @@ def _public_report_event(event: dict) -> dict:
     return {key: value for key, value in event.items() if not key.startswith("_")}
 
 
+def _public_loop_feedback(feedback: dict | None) -> dict:
+    """Loop 详情不暴露内部 claim/evidence 定位符。"""
+    public = dict(feedback or {})
+    public.pop("claim_verdicts", None)
+    return public
+
+
+def _public_repair_action(action: dict | None) -> dict | None:
+    if action is None:
+        return None
+    public = dict(action)
+    public.pop("artifact_version", None)
+    public.pop("target_claims", None)
+    return public
+
+
 class ResearchService:
     def __init__(self, session: AsyncSession):
         self.session = session
@@ -531,9 +547,9 @@ class ResearchService:
                 {
                     "iteration_no": it.iteration_no,
                     "scores": it.scores,  # {raw: {coverage:..., ...}, total: 0.78}
-                    "feedback": it.feedback,  # {summary, issues, missing_coverage, ...}
+                    "feedback": _public_loop_feedback(it.feedback),
                     "decision": it.decision,
-                    "repair_action": it.repair_action,
+                    "repair_action": _public_repair_action(it.repair_action),
                     "duration_ms": it.duration_ms,
                     "artifact_snapshot": it.artifact_snapshot,
                 }

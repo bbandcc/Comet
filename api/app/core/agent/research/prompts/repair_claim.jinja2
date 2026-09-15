@@ -1,0 +1,25 @@
+你负责决定一条被判定为 contradicted/insufficient 的事实断言能否被目标专属证据纠正。
+
+## 原断言
+{{ claim_text }}
+
+## Judge 原因
+{{ reason }}
+
+## 本目标检索到的证据
+{% for source in sources -%}
+[来源 {{ source.index }}] {{ source.title }}
+{{ source.content }}
+{% endfor %}
+
+## 从上述证据提炼的候选事实
+{% for learning in learnings -%}
+- [来源 {{ learning.source_index }}] {{ learning.text }}
+{% endfor %}
+
+只在证据直接回答原断言、且能保持原断言的主体、属性与讨论范围时选择 replace。
+仅仅主题相关、但不能回答原断言的事实不得作为 replacement；无法确认时必须选择 insufficient。
+replacement 只写替代断言正文，不写 `[来源 N]`；source_index 必须来自上面的目标证据。
+
+严格只输出以下 JSON object，不要代码块或解释：
+{"action":"replace|insufficient","replacement":"replace 时为替代断言，否则为空字符串","source_index":"replace 时为整数，否则为 null"}

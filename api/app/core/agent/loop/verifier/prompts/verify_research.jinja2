@@ -31,6 +31,15 @@
 
 {{ evidence_context }}
 
+## 待核验断言
+
+{% for claim in claims -%}
+- claim_id: {{ claim.claim_id }}
+  section_id: {{ claim.section_id }}
+  claim: {{ claim.claim_text }}
+  cited evidence refs: {{ claim.cited_sources | map(attribute='content_ref') | list }}
+{% endfor %}
+
 ## 输出格式(严格 JSON,不要任何代码块包裹)
 
 {
@@ -46,7 +55,15 @@
     ],
     "missing_coverage": ["<未充分回答的子问题/缺漏要点>"],
     "wrong_citations": [<引用错位或不可信的来源号,整数>],
-    "weak_chapters": ["<论证薄弱的章节标题>"]
+    "weak_chapters": ["<论证薄弱的章节标题>"],
+    "claim_verdicts": [
+      {
+        "claim_id": "<必须来自待核验断言>",
+        "status": "<supported|contradicted|insufficient>",
+        "evidence_refs": ["<本次实际使用且属于当前 artifact 的 content_ref>"],
+        "reason": "<简短依据>"
+      }
+    ]
   }
 }
 
@@ -56,3 +73,6 @@
 3. 没有问题的字段可以是 `[]`(空数组),但不能省略。
 4. 主题不带时效性(如纯理论 / 历史 / 数学)时,`timeliness` 给满分;但若主题明显需要时效(如行情、年度数据),严格扣分。
 5. 评分要严格:5 分是公开发表水准、3 分及格但有明显短板、1 分严重问题。
+6. `claim_verdicts` 必须逐条且仅一次覆盖所有待核验断言；没有断言时返回空数组。
+7. 无 cited evidence ref 的事实断言必须返回 `insufficient` 和空 `evidence_refs`；不得借用其它断言的证据。
+8. `supported / contradicted` 的 refs 必须来自该断言自己的 cited evidence，且下方实际提供了 evidence 正文；`omitted: true` 的来源不能作为依据。

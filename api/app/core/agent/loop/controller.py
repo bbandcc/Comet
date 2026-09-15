@@ -69,7 +69,8 @@ class RepairCallbackArgs:
     """打包给 RepairExecutor.execute 的上下文(避免参数膨胀)。"""
 
     def __init__(self, *, patch_callback=None, rewrite_callback=None, extras: dict | None = None):
-        self.patch_callback = patch_callback  # async fn(queries: list[str]) -> new_artifact
+        # claim repair 接收 RepairAction；legacy coverage patch 兼容接收 query list。
+        self.patch_callback = patch_callback
         self.rewrite_callback = rewrite_callback  # async fn(chapters: list[str]) -> new_artifact
         self.extras = extras or {}
 
@@ -259,10 +260,16 @@ class LoopController:
                             raise
                         current_score = score
                         final_score = score.total
+                        unresolved_claims = any(
+                            verdict.get("status") in {"contradicted", "insufficient"}
+                            for verdict in (score.feedback or {}).get("claim_verdicts", [])
+                            if isinstance(verdict, dict)
+                        )
                         final_quality_status = (
                             QUALITY_PASSED
                             if score.total >= self.rubric.pass_threshold
                             and not self.rubric.failed_dims(score.raw_scores)
+                            and not unresolved_claims
                             else QUALITY_FAILED
                         )
                         vsp.set_payload("total_score", round(score.total, 4))

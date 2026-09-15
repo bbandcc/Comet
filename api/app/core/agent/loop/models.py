@@ -102,12 +102,28 @@ DECISION_JUDGE_ERROR = "judge_error"
 DECISION_EXECUTION_ERROR = "execution_error"
 
 
+class ClaimRepairTarget(BaseModel):
+    """经严格 Judge 校验后交给 Patch 的单条目标断言。"""
+
+    claim_id: str
+    section_id: str
+    claim_text: str
+    locator_start: int = Field(ge=0)
+    locator_end: int = Field(gt=0)
+    repair_query: str
+    status: Literal["contradicted", "insufficient"]
+    evidence_refs: list[str] = Field(default_factory=list)
+    reason: str
+
+
 class RepairAction(BaseModel):
     """Repair 策略产生的修复动作描述(落库 + 给 generator 消费)。"""
 
     kind: str  # patch / chapter_rewrite / force_exceed
     patch_queries: list[str] = Field(default_factory=list)  # PatchRepair 补搜的子查询
     rewrite_chapters: list[str] = Field(default_factory=list)  # ChapterRewrite 要重写的章节标题
+    artifact_version: str | None = None
+    target_claims: list[ClaimRepairTarget] = Field(default_factory=list)
     rationale: str = ""  # 选这个动作的简要原因(给前端 audit)
 
 
@@ -136,6 +152,7 @@ __all__ = [
     "QUALITY_UNAVAILABLE",
     "QUALITY_SKIPPED",
     "VerifyScore",
+    "ClaimRepairTarget",
     "RepairAction",
     "IterationOutcome",
     "DECISION_PASS",

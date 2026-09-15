@@ -25,6 +25,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.core.agent.loop.controller import LoopController, RepairCallbackArgs
+from app.core.agent.loop.models import RepairAction
+from app.core.agent.research.claim_repair import (
+    ACTION_REPLACE,
+    decide_claim_replacement,
+)
+from app.core.agent.research.claims import (
+    apply_claim_replacements,
+    build_claim_contract,
+)
 from app.core.agent.research.curator import curate_outline
 from app.core.agent.research.distiller import distill_sources
 from app.core.agent.research.models import (
@@ -99,6 +108,8 @@ def _public_loop_event(event: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(final_artifact, dict):
         return event
     public_artifact = dict(final_artifact)
+    for internal_key in ("claims", "artifact_version", "cited_source_indices"):
+        public_artifact.pop(internal_key, None)
     public_artifact["sources"] = [
         {key: source.get(key) for key in ("index", "type", "title", "url") if key in source}
         for source in final_artifact.get("sources") or []
@@ -147,24 +158,16 @@ def _build_verifier_artifact(
     sources: list[Source],
 ) -> dict[str, Any]:
     """在展示 linkify 前保留正文真实引用号，供 Verifier 分配证据预算。"""
-    raw_texts = [str(summary.get("tldr") or "")]
-    raw_texts.extend(str(point) for point in summary.get("key_points") or [])
-    raw_texts.extend(content for _, content in sections)
-    available_indices = {source.index for source in sources}
-    cited_indices = sorted(
-        {
-            int(match)
-            for text in raw_texts
-            for match in _CITATION_RE.findall(text)
-            if int(match) in available_indices
-        }
-    )
+    artifact_version, claims = build_claim_contract(summary, sections, sources)
+    cited_indices = sorted({cited["index"] for claim in claims for cited in claim["cited_sources"]})
     return {
         "title": title,
         "markdown": _build_markdown(title, summary, sections, sources),
         "sources": [source.as_verifier_evidence() for source in sources],
         "headings": [heading for heading, _ in sections],
         "cited_source_indices": cited_indices,
+        "artifact_version": artifact_version,
+        "claims": claims,
     }
 
 
@@ -433,35 +436,140 @@ async def run_research(
         def _rebuild_artifact() -> dict[str, Any]:
             return _build_verifier_artifact(plan.title, loop_summary, loop_written, loop_sources)
 
+        async def _replace_body_and_refresh_summary(
+            updated_written: list[tuple[str, str]],
+        ) -> bool:
+            """仅在正文确实变化时替换正文并重建与之对应的摘要。"""
+            if updated_written == loop_written:
+                return False
+            body = "\n\n".join(f"## {h}\n{c}" for h, c in updated_written)
+            regenerated_summary = await summarize(model, plan.title, body)
+            loop_written[:] = updated_written
+            loop_summary.clear()
+            loop_summary.update(regenerated_summary)
+            return True
+
         initial_artifact = _rebuild_artifact()
 
-        async def patch_callback(queries: list[str]) -> dict[str, Any]:
-            """Patch:用 verifier 给的子查询补搜补提炼,把新要点作为「补充信息」追加到报告。"""
+        async def patch_callback(
+            action_or_queries: RepairAction | list[str],
+        ) -> dict[str, Any]:
+            """Patch:定向替换证据断言；普通覆盖缺漏仍走补充信息。"""
             try:
-                candidates = await _retrieve(None, queries)
-                merged, new_sources = deduplicate_sources(loop_sources, candidates)
-                if not new_sources:
-                    return _rebuild_artifact()
-                loop_sources[:] = merged
-                new_learnings = await distill_sources(
-                    model, topic, [h for h, _ in loop_written], new_sources, emit=None
+                action = (
+                    action_or_queries
+                    if isinstance(action_or_queries, RepairAction)
+                    else RepairAction(kind="patch", patch_queries=action_or_queries)
                 )
+                current_artifact = _rebuild_artifact()
+                if (
+                    action.artifact_version
+                    and action.artifact_version != current_artifact["artifact_version"]
+                ):
+                    logger.warning("patch_callback 收到过期 artifact version,拒绝修改")
+                    return current_artifact
+
+                if action.target_claims:
+                    replacements: dict[str, str] = {}
+                    for target in action.target_claims:
+                        target_learnings: list[Learning] = []
+                        target_sources: list[Source] = []
+                        try:
+                            candidates = await _retrieve(None, [target.repair_query])
+                            candidate_ids = {source.stable_id for source in candidates}
+                            merged, _ = deduplicate_sources(loop_sources, candidates)
+                            loop_sources[:] = merged
+                            target_sources = [
+                                source
+                                for source in loop_sources
+                                if source.stable_id in candidate_ids
+                            ]
+                            if target_sources:
+                                distilled = await distill_sources(
+                                    model,
+                                    f"{topic}\n待核验断言：{target.repair_query}",
+                                    [h for h, _ in loop_written],
+                                    target_sources,
+                                    emit=None,
+                                )
+                                target_indices = {source.index for source in target_sources}
+                                target_learnings = [
+                                    learning
+                                    for learning in distilled
+                                    if learning.source_index in target_indices
+                                ]
+                        except Exception as e:  # noqa: BLE001
+                            logger.warning(
+                                "目标 claim 补搜失败,降级为证据不足: claim=%s err=%s",
+                                target.claim_id,
+                                e,
+                            )
+                        if target_learnings:
+                            loop_learnings.extend(target_learnings)
+                        decision = await decide_claim_replacement(
+                            model,
+                            claim_text=target.claim_text,
+                            reason=target.reason,
+                            sources=target_sources,
+                            learnings=target_learnings,
+                        )
+                        replacements[target.claim_id] = (
+                            f"{decision.replacement} [来源 {decision.source_index}]"
+                            if decision.action == ACTION_REPLACE
+                            else "现有证据不足，无法确认。"
+                        )
+
+                    repaired_summary, repaired_sections, changed, body_changed = (
+                        apply_claim_replacements(
+                            loop_summary,
+                            loop_written,
+                            action.target_claims,
+                            replacements,
+                        )
+                    )
+                    if not changed:
+                        logger.warning("patch_callback 未定位到目标 claim,沿用当前 artifact")
+                        return _rebuild_artifact()
+                    if body_changed:
+                        await _replace_body_and_refresh_summary(repaired_sections)
+                    else:
+                        loop_summary.clear()
+                        loop_summary.update(repaired_summary)
+                        loop_written[:] = repaired_sections
+                    return _rebuild_artifact()
+
+                candidates = await _retrieve(None, action.patch_queries)
+                merged, new_sources = deduplicate_sources(loop_sources, candidates)
+                loop_sources[:] = merged
+                new_learnings: list[Learning] = []
+                if new_sources:
+                    new_learnings = await distill_sources(
+                        model,
+                        topic,
+                        [h for h, _ in loop_written],
+                        new_sources,
+                        emit=None,
+                    )
+                loop_learnings.extend(new_learnings)
                 if not new_learnings:
                     return _rebuild_artifact()
-                loop_learnings.extend(new_learnings)
                 # 简化合并:把新要点整理为一个「补充信息」章节追加(避免重写正文章节,成本低)
                 supp_heading = "补充信息(质量复核反馈后追加)"
                 supp_lines = [f"- {le.text} [来源 {le.source_index}]" for le in new_learnings]
                 supp_content = "\n".join(supp_lines) if supp_lines else "(无补充)"
-                # 替换或追加
-                idx = next((i for i, (h, _) in enumerate(loop_written) if h == supp_heading), None)
+                updated_written = list(loop_written)
+                idx = next(
+                    (i for i, (h, _) in enumerate(updated_written) if h == supp_heading),
+                    None,
+                )
                 if idx is None:
-                    loop_written.append((supp_heading, supp_content))
+                    updated_written.append((supp_heading, supp_content))
                 else:
-                    loop_written[idx] = (
+                    updated_written[idx] = (
                         supp_heading,
-                        (loop_written[idx][1] + "\n" + supp_content).strip(),
+                        (updated_written[idx][1] + "\n" + supp_content).strip(),
                     )
+                await _replace_body_and_refresh_summary(updated_written)
                 return _rebuild_artifact()
             except Exception as e:  # noqa: BLE001
                 logger.warning("patch_callback 失败,沿用旧报告: %s", e)
@@ -471,6 +579,7 @@ async def run_research(
             """Rewrite:重写指定章节(用 curated thesis + 已有 learnings 重新调 writer)。"""
             try:
                 heading_to_curated = {c.heading: c for c in curated}
+                updated_written = list(loop_written)
                 for ch in chapters:
                     cur = heading_to_curated.get(ch)
                     if cur is None:
@@ -486,9 +595,10 @@ async def run_research(
                     ):
                         buf.append(tok)
                     new_content = "".join(buf).strip() or "(本章节暂无内容)"
-                    idx = next((i for i, (h, _) in enumerate(loop_written) if h == ch), None)
+                    idx = next((i for i, (h, _) in enumerate(updated_written) if h == ch), None)
                     if idx is not None:
-                        loop_written[idx] = (ch, new_content)
+                        updated_written[idx] = (ch, new_content)
+                await _replace_body_and_refresh_summary(updated_written)
                 return _rebuild_artifact()
             except Exception as e:  # noqa: BLE001
                 logger.warning("rewrite_callback 失败,沿用旧报告: %s", e)
